@@ -51,7 +51,12 @@ type smoothWeightedState struct {
 type weightedSelectorStateModelKey struct{}
 
 func withWeightedSelectorStateModel(ctx context.Context, selector Selector, routeModel string) context.Context {
-	if _, ok := selector.(*WeightedRoundRobinSelector); !ok || strings.TrimSpace(routeModel) == "" {
+	if strings.TrimSpace(routeModel) == "" {
+		return ctx
+	}
+	switch selector.(type) {
+	case *WeightedRoundRobinSelector, *ResetPressureSelector:
+	default:
 		return ctx
 	}
 	return context.WithValue(ctx, weightedSelectorStateModelKey{}, routeModel)

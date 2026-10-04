@@ -17,6 +17,7 @@ func TestManagerAliasQuotaFailoverWithUnobservedTargetModel(t *testing.T) {
 	for name, newSelector := range map[string]func() Selector{
 		"round-robin":          func() Selector { return &RoundRobinSelector{} },
 		"weighted-round-robin": func() Selector { return &WeightedRoundRobinSelector{} },
+		"reset-pressure":       func() Selector { return &ResetPressureSelector{} },
 		"fill-first":           func() Selector { return &FillFirstSelector{} },
 	} {
 		for _, path := range []string{"select", "execute", "stream"} {

@@ -656,13 +656,20 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	if isBuiltInSelector(selector) {
 		return ""
 	}
+	// Pressure selection also consumes model-resolved candidate snapshots, but
+	// must not use the static scheduler fast path used by other built-ins.
+	if _, resetPressure := selector.(*ResetPressureSelector); resetPressure {
+		return ""
+	}
 	return routeModel
 }
 
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
-		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		_, sessionAffinity := selector.(*SessionAffinitySelector)
+		_, resetPressure := selector.(*ResetPressureSelector)
+		if !sessionAffinity && !resetPressure {
 			return ctx
 		}
 	}

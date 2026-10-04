@@ -18,6 +18,7 @@ func TestManagerSessionAffinityAliasCooldownPreservesSelection(t *testing.T) {
 	for strategy, newFallback := range map[string]func() Selector{
 		"round-robin":          func() Selector { return &RoundRobinSelector{} },
 		"weighted-round-robin": func() Selector { return &WeightedRoundRobinSelector{} },
+		"reset-pressure":       func() Selector { return &ResetPressureSelector{} },
 		"fill-first":           func() Selector { return &FillFirstSelector{} },
 	} {
 		for _, mode := range []string{"no-session", "explicit-session", "lcp"} {
