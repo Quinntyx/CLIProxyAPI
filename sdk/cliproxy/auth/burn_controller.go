@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -680,13 +681,64 @@ func (b *BurnController) key(id string) string {
 	}
 	return id
 }
-func (b *BurnController) ensureIdentity(a *Auth) {
+
+// Team workspaces have multiple independently metered seats. Never merge their
+// quotas, caps or weekly efficiency just because ChatGPT-Account-ID is shared.
+func codexQuotaIdentity(a *Auth) string {
 	account, _ := a.Metadata["account_id"].(string)
 	if account == "" {
-		return
+		return ""
+	}
+	plan, _ := a.Metadata["plan_type"].(string)
+	if strings.EqualFold(plan, "team") {
+		user, _ := a.Metadata["quota_user_id"].(string)
+		var subject string
+		if user == "" {
+			for _, field := range []string{"id_token", "access_token"} {
+				token, _ := a.Metadata[field].(string)
+				parts := strings.Split(token, ".")
+				if len(parts) < 2 {
+					continue
+				}
+				raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+				if err != nil {
+					continue
+				}
+				var claims map[string]any
+				if json.Unmarshal(raw, &claims) != nil {
+					continue
+				}
+				if scope, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+					user, _ = scope["chatgpt_user_id"].(string)
+				}
+				if user != "" {
+					break
+				}
+				if subject == "" {
+					subject, _ = claims["sub"].(string)
+				}
+			}
+			if user == "" {
+				user = subject
+			}
+			if user == "" {
+				email, _ := a.Metadata["email"].(string)
+				user = strings.ToLower(strings.TrimSpace(email))
+			}
+		}
+		if user != "" {
+			account += "\x1f" + user
+		}
 	}
 	digest := sha256.Sum256([]byte(account))
-	key := fmt.Sprintf("codex:%x", digest)
+	return fmt.Sprintf("codex:%x", digest)
+}
+
+func (b *BurnController) ensureIdentity(a *Auth) {
+	key := codexQuotaIdentity(a)
+	if key == "" {
+		return
+	}
 	old := b.key(a.ID)
 	b.aliases[a.ID] = key
 	if old != key && b.accounts[key] == nil && b.accounts[old] != nil {

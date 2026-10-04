@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"math"
 	"net/http"
 	"os"
@@ -315,5 +317,26 @@ func TestBurnWebSocketRebindsUnavailableAccount(t *testing.T) {
 	a := &Auth{ID: "retired", Provider: "codex", Disabled: true}
 	if !b.WantsSwitch(a, []*Auth{a}, time.Now(), "gpt-5.5") {
 		t.Fatal("retired websocket account must rebind")
+	}
+}
+
+func TestBurnTeamSeatsHaveIndependentQuotaIdentities(t *testing.T) {
+	a := &Auth{ID: "seat-a", Provider: "codex", Metadata: map[string]any{"account_id": "workspace", "plan_type": "team", "quota_user_id": "user-a"}}
+	b := &Auth{ID: "seat-b", Provider: "codex", Metadata: map[string]any{"account_id": "workspace", "plan_type": "team", "quota_user_id": "user-b"}}
+	if codexQuotaIdentity(a) == codexQuotaIdentity(b) {
+		t.Fatal("different Team seats collided")
+	}
+	duplicate := a.Clone()
+	duplicate.ID = "refreshed"
+	if codexQuotaIdentity(a) != codexQuotaIdentity(duplicate) {
+		t.Fatal("credential rotation changed seat identity")
+	}
+	claims := map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user-a"}}
+	raw, _ := json.Marshal(claims)
+	token := a.Clone()
+	delete(token.Metadata, "quota_user_id")
+	token.Metadata["id_token"] = "header." + base64.RawURLEncoding.EncodeToString(raw) + ".signature"
+	if codexQuotaIdentity(a) != codexQuotaIdentity(token) {
+		t.Fatal("JWT seat identity differs from staged identity")
 	}
 }
