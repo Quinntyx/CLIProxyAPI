@@ -30,6 +30,7 @@ type routingRuntimeState struct {
 	sessionAffinity          bool
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
+	burnDeadline             bool
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -50,6 +51,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	case "reset-pressure", "resetpressure", "rp":
 		state.strategy = "reset-pressure"
 	}
+	state.burnDeadline = cfg.Routing.BurnDeadline.Enabled
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
@@ -84,6 +86,9 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 			TTL:              state.sessionAffinityTTL,
 			SubagentAffinity: &subagents,
 		})
+	}
+	if state.burnDeadline {
+		selector = &coreauth.BurnDeadlineSelector{Fallback: selector}
 	}
 	return selector
 }
@@ -225,6 +230,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	coreauth.ConfigureBurnDeadline(commit.cfg.Routing.BurnDeadline)
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
 		s.coreManager.SetSelector(newRoutingSelector(routingState))

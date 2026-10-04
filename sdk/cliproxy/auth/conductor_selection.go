@@ -1645,7 +1645,16 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.Selector())
+	m.mu.RLock()
+	capped := false
+	for _, a := range m.auths {
+		if hasBurnCaps(a) {
+			capped = true
+			break
+		}
+	}
+	m.mu.RUnlock()
+	return !capped && isBuiltInSelector(m.Selector())
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -1815,6 +1824,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			authCopy = current.Clone()
 		}
 		m.mu.Unlock()
+	}
+	if !DefaultBurnController.RefreshCaps(ctx, authCopy) {
+		nextTried := make(map[string]struct{}, len(tried)+1)
+		for id := range tried {
+			nextTried[id] = struct{}{}
+		}
+		nextTried[authCopy.ID] = struct{}{}
+		return m.pickNextLegacy(ctx, provider, model, opts, nextTried)
 	}
 	return authCopy, executor, nil
 }
@@ -2154,6 +2171,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			authCopy = current.Clone()
 		}
 		m.mu.Unlock()
+	}
+	if !DefaultBurnController.RefreshCaps(ctx, authCopy) {
+		nextTried := make(map[string]struct{}, len(tried)+1)
+		for id := range tried {
+			nextTried[id] = struct{}{}
+		}
+		nextTried[authCopy.ID] = struct{}{}
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, nextTried)
 	}
 	return authCopy, executor, providerKey, nil
 }

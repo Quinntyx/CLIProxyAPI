@@ -55,6 +55,8 @@ func (s *Service) Run(ctx context.Context) error {
 	s.startModelCatalogUpdaters(ctx)
 
 	usage.StartDefault(ctx)
+	stopBurnController := coreauth.StartBurnController(ctx, s.cfg.Routing.BurnDeadline, s.coreManager.List)
+	defer stopBurnController()
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)

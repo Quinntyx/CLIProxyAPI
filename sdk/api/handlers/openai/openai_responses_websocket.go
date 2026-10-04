@@ -271,7 +271,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	var duplexInput <-chan cliproxyexecutor.WebsocketInput
-	if h != nil && h.Cfg != nil && h.Cfg.CodexResponseSteering {
+	if h != nil && h.Cfg != nil && h.Cfg.CodexResponseSteering && (h.AuthManager == nil || !coreauth.BurnRequiresTurnRouting(h.AuthManager.List())) {
 		socketCtx, cancelSocket := context.WithCancel(c.Request.Context())
 		defer cancelSocket()
 		c.Request = c.Request.WithContext(socketCtx)
@@ -459,6 +459,25 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		)
 		pluginExecutorID := handlers.PreparedStreamPluginExecutor(executionParent)
 		isPluginExecutorRoute := pluginExecutorID != ""
+
+		// Burn/cap switches occur only at turn boundaries, before any input is accepted upstream.
+		// A cached delta belongs to the old account: reject it so the client reconnects with FULL context.
+		if pinnedAuthID != "" && h.AuthManager != nil {
+			if current, ok := sessionAuthByID(pinnedAuthID); ok && (!coreauth.DefaultBurnController.RefreshCaps(c.Request.Context(), current) || coreauth.DefaultBurnController.WantsSwitch(current, h.AuthManager.List(), time.Now(), gjson.GetBytes(payload, "model").String())) {
+				forgetPinnedAuth()
+				h.AuthManager.CloseExecutionSession(passthroughSessionID)
+				upstreamMode = responsesWebsocketUpstreamModeUnknown
+				upstreamWebsocketAuthID = ""
+				if gjson.GetBytes(payload, "previous_response_id").String() != "" {
+					_, writeErr := writeResponsesWebsocketError(writer, wsTimelineLog, responsesWebsocketPreviousResponseNotFoundError())
+					if writeErr != nil {
+						return
+					}
+					continue
+				}
+			}
+		}
+
 		if pinnedAuthID != "" {
 			pinnedAuth, homeRuntime, ok := sessionAuthByIDWithSource(pinnedAuthID)
 			providerKey := ""

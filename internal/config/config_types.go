@@ -349,7 +349,17 @@ type QuotaExceeded struct {
 }
 
 // RoutingConfig configures how credentials are selected for requests.
+// BurnDeadlineConfig enables empirical quota-burn deadlines and persistent weekly accounting.
+type BurnDeadlineConfig struct {
+	Enabled           bool    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Threshold         float64 `yaml:"threshold,omitempty" json:"threshold,omitempty"`
+	PollInterval      string  `yaml:"poll-interval,omitempty" json:"poll-interval,omitempty"`
+	MaxObservationAge string  `yaml:"max-observation-age,omitempty" json:"max-observation-age,omitempty"`
+	StateFile         string  `yaml:"state-file,omitempty" json:"state-file,omitempty"`
+}
+
 type RoutingConfig struct {
+	BurnDeadline BurnDeadlineConfig `yaml:"burn-deadline,omitempty" json:"burn-deadline,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "reset-pressure".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`

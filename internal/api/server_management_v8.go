@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // registerManagementV8Routes defines the v8 contract independently of v0.
@@ -38,6 +39,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/observability/logs/errors/:name", s.mgmt.DownloadRequestErrorLog)
 	v8.GET("/observability/logs/requests/:id", s.mgmt.GetRequestLogByID)
 	v8.GET("/observability/usage/api-keys", s.mgmt.GetAPIKeyUsage)
+	v8.GET("/observability/burn", func(c *gin.Context) { c.JSON(http.StatusOK, coreauth.DefaultBurnController.Snapshot()) })
 	v8.GET("/observability/usage/queue", s.mgmt.GetUsageQueue)
 
 	v8.GET("/credentials", s.mgmt.ListAuthFiles)
