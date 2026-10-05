@@ -835,6 +835,18 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if !DefaultBurnController.CapPermits(auth, now) {
 		return true, blockReasonOther, time.Time{}
 	}
+	return isAuthBlockedForModelState(auth, model, now)
+}
+
+// isAuthBlockedForModelState inspects scheduler state without observing quota
+// or updating cap policies. Read-only telemetry checks caps on its own snapshot.
+func isAuthBlockedForModelState(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	if auth == nil {
+		return true, blockReasonOther, time.Time{}
+	}
+	if auth.Disabled || auth.Status == StatusDisabled {
+		return true, blockReasonDisabled, time.Time{}
+	}
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}

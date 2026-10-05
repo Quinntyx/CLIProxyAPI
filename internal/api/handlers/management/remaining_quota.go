@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // GetRemainingQuota returns cap-adjusted totals and the actual affinity-bound
@@ -25,12 +24,6 @@ func (h *Handler) GetRemainingQuota(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "model or session_id too long"})
 		return
 	}
-	var current *coreauth.Auth
-	binding := "unbound"
-	if model != "" && session != "" {
-		current, binding = manager.LookupSessionAffinity("codex", model, session)
-	}
-	result := coreauth.DefaultBurnController.RemainingQuota(manager.List(), current)
-	result.CurrentBinding = binding
+	result := manager.RemainingQuotaStatus(model, session)
 	c.JSON(http.StatusOK, result)
 }

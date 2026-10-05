@@ -458,11 +458,12 @@ func (m *Manager) LookupSessionAffinity(provider, model, sessionID string) (*Aut
 	if m == nil {
 		return nil, "unsupported"
 	}
-	m.mu.RLock()
-	if m.pluginScheduler != nil {
-		m.mu.RUnlock()
+	// A plugin host is attached even when it has no scheduler. Only an
+	// active scheduler overrides the built-in selector/affinity authority.
+	if m.hasPluginScheduler() {
 		return nil, "unsupported"
 	}
+	m.mu.RLock()
 	sel := m.selector
 	authProviderMap := make(map[string]string, len(m.auths))
 	for id, a := range m.auths {

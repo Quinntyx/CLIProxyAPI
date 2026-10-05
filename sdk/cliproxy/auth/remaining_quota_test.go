@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	exec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -131,13 +132,16 @@ func TestBurnWrapperPreservesActualAffinityInspection(t *testing.T) {
 	if _, err := manager.Register(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
+	// Production attaches a plugin host even with no active scheduler.
+	inactive := &inactivePluginScheduler{}
+	manager.SetPluginScheduler(inactive)
 	model := "gpt-6.1-sol"
 	session := "footer-session"
 	got, status := manager.LookupSessionAffinity("codex", model, session)
 	if got != nil || status != "unbound" {
 		t.Fatal("inspection created binding", status)
 	}
-	_, err := wrapper.Pick(context.Background(), "codex", model, exec.Options{Headers: http.Header{"Session-Id": []string{session}}}, []*Auth{a})
+	_, err := wrapper.Pick(context.Background(), "mixed", model, exec.Options{Headers: http.Header{"Session-Id": []string{session}}}, []*Auth{a})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,5 +152,133 @@ func TestBurnWrapperPreservesActualAffinityInspection(t *testing.T) {
 	got, status = manager.LookupSessionAffinity("codex", "another-model", session)
 	if got != nil || status != "unbound" {
 		t.Fatal("model-specific binding leaked", status)
+	}
+	if inactive.calls != 0 {
+		t.Fatal("read-only inspection invoked a scheduler")
+	}
+	manager.SetPluginScheduler(&fakePluginScheduler{})
+	if got, status = manager.LookupSessionAffinity("codex", model, session); got != nil || status != "unsupported" {
+		t.Fatal("active custom scheduler was treated as built-in affinity", status)
+	}
+}
+
+func TestRemainingQuotaReportsStrandedBudgetAndRoutingSeparately(t *testing.T) {
+	now := time.Now()
+	b := burnTestController(now)
+	shared, exhausted, cooldown := quotaTestAuth("shared", true), quotaTestAuth("exhausted", false), quotaTestAuth("cooldown", false)
+	for _, tc := range []struct {
+		a    *Auth
+		h, w float64
+	}{{shared, 4, 50}, {exhausted, 100, 71}, {cooldown, 0, 72}} {
+		b.Observe(tc.a, burnTestQuota(now, tc.h, tc.w, now.Add(time.Hour), now.Add(24*time.Hour)), now)
+	}
+	auths := []*Auth{shared, exhausted, cooldown}
+	before, _ := json.Marshal(burnDisk{Accounts: b.accounts, Aliases: b.aliases, Weeks: b.history})
+	// Shared is hard-capped by its weekly window. Another account is on a
+	// five-hour cooldown, even if passive quota observations still show headroom.
+	result := b.remainingQuota(auths, cooldown, map[string]bool{shared.ID: true, exhausted.ID: true, cooldown.ID: false})
+	quotaAssert(t, result.FiveHour.TotalPercent, 146)
+	quotaAssert(t, result.Weekly.TotalPercent, 57)
+	quotaAssert(t, result.FiveHour.CurrentPercent, 100)
+	if result.RoutingAvailable == nil || *result.RoutingAvailable || result.CurrentAvailable == nil || *result.CurrentAvailable || result.AvailableAccounts != 0 {
+		t.Fatal("stranded budgets reported as routable", result)
+	}
+	quotaAssert(t, result.FiveHour.AvailablePercent, 0)
+	quotaAssert(t, result.Weekly.AvailablePercent, 0)
+	// Recovery must update availability without losing the unspent budgets.
+	ready := b.remainingQuota(auths, cooldown, map[string]bool{shared.ID: true, exhausted.ID: true, cooldown.ID: true})
+	if ready.RoutingAvailable == nil || !*ready.RoutingAvailable || ready.AvailableAccounts != 1 {
+		t.Fatal("recovered route still blocked", ready)
+	}
+	quotaAssert(t, ready.FiveHour.AvailablePercent, 100)
+	quotaAssert(t, ready.Weekly.AvailablePercent, 28)
+	after, _ := json.Marshal(burnDisk{Accounts: b.accounts, Aliases: b.aliases, Weeks: b.history})
+	if string(before) != string(after) {
+		t.Fatal("telemetry changed weekly accounting")
+	}
+}
+
+func TestRemainingQuotaRoutingRequiresFreshCapsAndDeduplicates(t *testing.T) {
+	now := time.Now()
+	b := burnTestController(now)
+	a := quotaTestAuth("shared", true)
+	b.Observe(a, burnTestQuota(now, 10, 20, now.Add(time.Hour), now.Add(24*time.Hour)), now)
+	duplicate := a.Clone()
+	duplicate.ID = "duplicate"
+	delete(duplicate.Metadata, "five_hour_cap_percent")
+	delete(duplicate.Metadata, "weekly_cap_percent")
+	auths := []*Auth{a, duplicate}
+	eligible := map[string]bool{a.ID: true, duplicate.ID: true}
+	got := b.remainingQuota(auths, duplicate, eligible)
+	if got.AvailableAccounts != 1 {
+		t.Fatal("duplicate seats double-counted", got)
+	}
+	quotaAssert(t, got.FiveHour.AvailablePercent, 40)
+	w := b.accounts[codexQuotaIdentity(a)].Windows["weekly"]
+	w.Observed = now.Add(-b.maxAge() - time.Second)
+	stale := b.remainingQuota(auths, duplicate, eligible)
+	if *stale.RoutingAvailable || stale.AvailableAccounts != 0 {
+		t.Fatal("uncapped alias bypassed stale seat cap", stale)
+	}
+	quotaAssert(t, stale.FiveHour.AvailablePercent, 0)
+	if stale.Weekly.TotalPercent != nil {
+		t.Fatal("stale remaining quota guessed")
+	}
+	w.Observed = now
+	b.capFailures = map[string]time.Time{codexQuotaIdentity(a): now.Add(time.Second)}
+	failed := b.remainingQuota(auths, duplicate, eligible)
+	if *failed.RoutingAvailable {
+		t.Fatal("quota poll failure ignored")
+	}
+}
+
+func TestManagerRemainingQuotaUsesLiveModelEligibilityAndActualBinding(t *testing.T) {
+	now := time.Now()
+	b := burnTestController(now)
+	previous := DefaultBurnController
+	DefaultBurnController = b
+	t.Cleanup(func() { DefaultBurnController = previous })
+	affinity := NewSessionAffinitySelector(&RoundRobinSelector{})
+	manager := NewManager(nil, &BurnDeadlineSelector{Fallback: affinity, Controller: b}, nil)
+	manager.SetPluginScheduler(&inactivePluginScheduler{})
+	a := quotaTestAuth("remaining-model-test", false)
+	a.Quota = burnTestQuota(now, 25, 72, now.Add(time.Hour), now.Add(24*time.Hour))
+	if _, err := manager.Register(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	b.Observe(a, a.Quota, now)
+	model := "gpt-6.1-sol"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(a.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(a.ID) })
+	session := "pi-current-session"
+	if _, err := affinity.Pick(context.Background(), "mixed", model, exec.Options{Headers: http.Header{"Session-Id": []string{session}}}, []*Auth{a}); err != nil {
+		t.Fatal(err)
+	}
+	got := manager.RemainingQuotaStatus(model, session)
+	if got.CurrentBinding != "bound" || got.RoutingAvailable == nil || !*got.RoutingAvailable {
+		t.Fatal("production-shaped manager lost binding or routing", got)
+	}
+	quotaAssert(t, got.FiveHour.CurrentPercent, 75)
+	quotaAssert(t, got.Weekly.CurrentPercent, 28)
+	// Passive percent readings need not reflect the latest model-specific 429.
+	a.ModelStates = map[string]*ModelState{model: {Unavailable: true, NextRetryAfter: now.Add(time.Hour)}}
+	if _, err := manager.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	got = manager.RemainingQuotaStatus(model, session)
+	if got.RoutingAvailable == nil || *got.RoutingAvailable {
+		t.Fatal("model-specific cooldown ignored", got)
+	}
+	quotaAssert(t, got.FiveHour.TotalPercent, 75)
+	quotaAssert(t, got.FiveHour.AvailablePercent, 0)
+	// Other windows/models must not inherit the wrong model's eligibility.
+	unsupported := manager.RemainingQuotaStatus("not-registered", session)
+	if unsupported.RoutingAvailable == nil || *unsupported.RoutingAvailable {
+		t.Fatal("unregistered model advertised as available", unsupported)
+	}
+	unscoped := manager.RemainingQuotaStatus("", "")
+	if unscoped.RoutingAvailable != nil {
+		t.Fatal("unscoped quota invented routing state", unscoped)
 	}
 }
