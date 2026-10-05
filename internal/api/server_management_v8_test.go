@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestManagementV8RoutesShareAccessControl(t *testing.T) {
@@ -216,5 +217,50 @@ func TestManagementV8PluginOperationMigratesConfiguration(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("missing configuration reload")
+	}
+}
+
+func TestRemainingQuotaManagementRouteAccessControl(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name                string
+		enabled, authorized bool
+		want                int
+	}{{"authorized", true, true, 200}, {"missing key", true, false, 401}, {"disabled", false, true, 404}} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte("port: 8317\nremote-management: {secret-key: test-password}\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Plugins.Dir = filepath.Dir(path)
+			h := management.NewHandler(cfg, path, coreauth.NewManager(nil, nil, nil))
+			h.SetLocalPassword("test-password")
+			s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+			s.managementRoutesEnabled.Store(tc.enabled)
+			s.registerManagementRoutes()
+			req := httptest.NewRequest(http.MethodGet, "/v8/management/observability/quota/remaining?model=gpt-6.1-sol&session_id=footer-test", nil)
+			req.RemoteAddr = "127.0.0.1:1234"
+			if tc.authorized {
+				req.Header.Set("Authorization", "Bearer test-password")
+			}
+			response := httptest.NewRecorder()
+			s.engine.ServeHTTP(response, req)
+			if response.Code != tc.want {
+				t.Fatal(response.Code, response.Body.String())
+			}
+			if tc.want == 200 {
+				var data coreauth.RemainingQuotaStatus
+				if err := json.Unmarshal(response.Body.Bytes(), &data); err != nil {
+					t.Fatal(err)
+				}
+				if data.Weekly.TotalPercent == nil || *data.Weekly.TotalPercent != 0 {
+					t.Fatal(data)
+				}
+			}
+		})
 	}
 }

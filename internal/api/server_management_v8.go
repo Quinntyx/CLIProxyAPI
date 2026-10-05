@@ -40,6 +40,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/observability/logs/requests/:id", s.mgmt.GetRequestLogByID)
 	v8.GET("/observability/usage/api-keys", s.mgmt.GetAPIKeyUsage)
 	v8.GET("/observability/burn", func(c *gin.Context) { c.JSON(http.StatusOK, coreauth.DefaultBurnController.Snapshot()) })
+	v8.GET("/observability/quota/remaining", s.mgmt.GetRemainingQuota)
 	v8.GET("/observability/usage/queue", s.mgmt.GetUsageQueue)
 
 	v8.GET("/credentials", s.mgmt.ListAuthFiles)
