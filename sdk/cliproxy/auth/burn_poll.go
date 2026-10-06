@@ -19,7 +19,7 @@ import (
 
 // StartBurnController polls quota WITHOUT generating model tokens, including idle weeks.
 // There is a single poll loop, bounded to three concurrent requests, with per-request deadlines.
-func StartBurnController(ctx context.Context, cfg config.BurnDeadlineConfig, list func() []*Auth) func() {
+func StartBurnController(ctx context.Context, cfg config.BurnDeadlineConfig, list func() []*Auth, observers ...func(context.Context, *Auth, QuotaState)) func() {
 	b := DefaultBurnController
 	if strings.HasPrefix(cfg.StateFile, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -29,6 +29,7 @@ func StartBurnController(ctx context.Context, cfg config.BurnDeadlineConfig, lis
 	b.configure(cfg)
 	b.mu.Lock()
 	b.list = list
+	b.quotaObservers = observers
 	b.mu.Unlock()
 	if !cfg.Enabled {
 		return func() {}
@@ -68,6 +69,7 @@ func StartBurnController(ctx context.Context, cfg config.BurnDeadlineConfig, lis
 func (b *BurnController) pollAll(ctx context.Context) {
 	b.mu.Lock()
 	list := b.list
+	observers := append([]func(context.Context, *Auth, QuotaState){}, b.quotaObservers...)
 	b.mu.Unlock()
 	if list == nil {
 		return
@@ -100,6 +102,11 @@ func (b *BurnController) pollAll(ctx context.Context) {
 				return
 			}
 			b.Observe(a, q, b.now())
+			for _, observer := range observers {
+				if observer != nil {
+					observer(ctx, a, q)
+				}
+			}
 		}()
 	}
 	wg.Wait()
@@ -151,14 +158,22 @@ func pollCodexQuota(ctx context.Context, a *Auth) (QuotaState, error) {
 	}
 	var payload struct {
 		RateLimit struct {
-			Primary   *burnQuotaWindow `json:"primary_window"`
-			Secondary *burnQuotaWindow `json:"secondary_window"`
+			Allowed      *bool            `json:"allowed"`
+			LimitReached *bool            `json:"limit_reached"`
+			Primary      *burnQuotaWindow `json:"primary_window"`
+			Secondary    *burnQuotaWindow `json:"secondary_window"`
 		} `json:"rate_limit"`
 	}
 	if err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
 		return empty, err
 	}
 	headers := http.Header{}
+	if payload.RateLimit.Allowed != nil {
+		headers.Set("x-codex-allowed", fmt.Sprint(*payload.RateLimit.Allowed))
+	}
+	if payload.RateLimit.LimitReached != nil {
+		headers.Set("x-codex-limit-reached", fmt.Sprint(*payload.RateLimit.LimitReached))
+	}
 	for i, w := range []*burnQuotaWindow{payload.RateLimit.Primary, payload.RateLimit.Secondary} {
 		if w == nil {
 			continue

@@ -33,6 +33,7 @@ type BurnController struct {
 	forced                      string
 	forcedReset                 time.Time
 	list                        func() []*Auth
+	quotaObservers              []func(context.Context, *Auth, QuotaState)
 	now                         func() time.Time
 	lastTokenTPS, lastOutputTPS float64
 	capChecks                   map[string]chan struct{}
