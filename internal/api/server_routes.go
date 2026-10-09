@@ -63,6 +63,8 @@ func (s *Server) setupRoutes() {
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
+		// Read-only quota status uses the same client-key authorization as inference.
+		v1.GET("/quota/remaining", s.mgmt.GetRemainingQuota)
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.GET("/models/*model", func(c *gin.Context) {
 			c.Set(handlers.ModelDetailIDContextKey, strings.TrimPrefix(c.Param("model"), "/"))
