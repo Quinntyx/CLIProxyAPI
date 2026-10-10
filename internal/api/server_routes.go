@@ -61,10 +61,15 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(AuthMiddleware(s.accessManager), s.sessionQuotaFailClosed())
 	{
 		// Read-only quota status uses the same client-key authorization as inference.
 		v1.GET("/quota/remaining", s.mgmt.GetRemainingQuota)
+		v1.GET("/session-quota", s.sessionQuotaStatus)
+		v1.PUT("/session-quota/sessions/*session", s.sessionQuotaSet)
+		v1.DELETE("/session-quota/sessions/*session", s.sessionQuotaClear)
+		v1.DELETE("/session-quota/sessions", s.sessionQuotaClearAll)
+		v1.POST("/session-quota/skim", s.sessionQuotaSkim)
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.GET("/models/*model", func(c *gin.Context) {
 			c.Set(handlers.ModelDetailIDContextKey, strings.TrimPrefix(c.Param("model"), "/"))
@@ -116,7 +121,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager))
+	codexDirect.Use(AuthMiddleware(s.accessManager), s.sessionQuotaFailClosed())
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)

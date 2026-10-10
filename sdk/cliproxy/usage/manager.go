@@ -88,6 +88,27 @@ type Detail struct {
 	ResponseServiceTier string
 }
 
+// WithRecordObserver adds a synchronous, request-scoped accounting observer.
+// It runs before asynchronous usage sinks, so stream finalization cannot race
+// the quota ledger. Observers must be concurrency-safe and must not block on I/O
+// other than their bounded durable bookkeeping.
+type recordObserverContextKey struct{}
+
+func WithRecordObserver(ctx context.Context, observer func(context.Context, Record)) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	previous, _ := ctx.Value(recordObserverContextKey{}).(func(context.Context, Record))
+	return context.WithValue(ctx, recordObserverContextKey{}, func(ctx context.Context, record Record) {
+		if previous != nil {
+			previous(ctx, record)
+		}
+		if observer != nil {
+			observer(ctx, record)
+		}
+	})
+}
+
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
@@ -403,6 +424,11 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 			record.TraceID = trID
 		} else if trID := internallogging.GetRequestID(ctx); trID != "" {
 			record.TraceID = trID
+		}
+	}
+	if ctx != nil {
+		if observer, ok := ctx.Value(recordObserverContextKey{}).(func(context.Context, Record)); ok && observer != nil {
+			observer(ctx, record)
 		}
 	}
 	// ensure worker is running even if Start was not called explicitly
