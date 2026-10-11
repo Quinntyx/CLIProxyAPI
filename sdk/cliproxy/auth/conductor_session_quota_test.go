@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"testing"
 	"time"
 
@@ -272,5 +273,72 @@ func TestSessionQuotaUsesBackgroundPollerWhilePaused(t *testing.T) {
 	m.SyncSessionQuota()
 	if got := q.Snapshot().TotalRemaining; math.Abs(got-12) > 1e-6 {
 		t.Fatalf("pool=%v want freshest polled 12", got)
+	}
+}
+
+func TestSessionQuotaHintsStayLocalAndActualUsageIsAuthoritative(t *testing.T) {
+	m, q, model := quotaManager(t)
+	_ = q.Set("workflow", 250)
+	m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(ctx context.Context, a *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+		for _, key := range []string{sessionquota.Header, sessionquota.InputTokensHeader, sessionquota.CachedTokensHeader} {
+			if opts.Headers.Get(key) != "" {
+				t.Fatalf("proxy-local header leaked: %s", key)
+			}
+		}
+		usage.PublishRecord(ctx, usage.Record{Provider: "codex", AuthID: a.ID, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 100}})
+		return cliproxyexecutor.Response{}, nil
+	}})
+	headers := http.Header{}
+	headers.Set(sessionquota.Header, "workflow")
+	headers.Set(sessionquota.InputTokensHeader, "10")
+	headers.Set(sessionquota.CachedTokensHeader, "10")
+	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hello","max_output_tokens":10}`)}, cliproxyexecutor.Options{Headers: headers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headers.Get(sessionquota.InputTokensHeader) != "10" {
+		t.Fatal("mutated caller headers")
+	}
+	b := quotaBucket(t, q, "workflow")
+	if math.Abs(b.Remaining-249.86) > 1e-6 || b.Held != 0 {
+		t.Fatalf("hint became billing record: %+v", b)
+	}
+}
+
+func TestSessionQuotaFinalUsageReleasesHeldBeforeStreamEOF(t *testing.T) {
+	m, q, model := quotaManager(t)
+	_ = q.Set("workflow", 250)
+	terminalUsage := make(chan struct{})
+	eof := make(chan struct{})
+	m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(ctx context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+		chunks := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(chunks)
+			chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: tool call\n\n")}
+			usage.PublishRecord(ctx, usage.Record{Provider: "codex", AuthID: a.ID, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 100}})
+			close(terminalUsage)
+			<-eof
+		}()
+		return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+	}})
+	stream, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hi","max_output_tokens":1000}`)}, cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-stream.Chunks
+	select {
+	case <-terminalUsage:
+	case <-time.After(time.Second):
+		t.Fatal("terminal usage missing")
+	}
+	held := quotaBucket(t, q, "workflow").Held
+	close(eof)
+	for range stream.Chunks {
+	}
+	if held != 0 {
+		t.Fatalf("completed model response held %.6f points while client executes tools", held)
+	}
+	if math.Abs(quotaBucket(t, q, "workflow").Remaining-249.86) > 1e-6 {
+		t.Fatal("completion double billed")
 	}
 }

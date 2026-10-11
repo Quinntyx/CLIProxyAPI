@@ -447,17 +447,28 @@ func (m *Manager) ClearAll() error {
 // Skim transfers an absolute number of quota points, allocation-weighted, and
 // redistributes a dry donor's shortfall among the other funded donors.
 func (m *Manager) Skim(amount float64) (float64, error) {
+	return m.SkimTo("", amount)
+}
+
+// SkimTo funds the requested registered bucket, or interactive when unregistered.
+// Other buckets (including interactive) donate by allocation size, without
+// touching held reservations or changing caps. Explicit skims may exceed a cap.
+func (m *Manager) SkimTo(session string, amount float64) (float64, error) {
 	if !finite(amount) || amount < 0 || amount > Capacity {
 		return 0, errors.New("skim amount must be 0..250 quota points")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.advanceLocked()
+	destination := m.state.Buckets[session]
+	if destination == nil || destination.Cap <= 0 {
+		destination = m.state.Buckets[""]
+	}
 	left := amount
 	for left > epsilon {
 		weight := 0.0
-		for name, b := range m.state.Buckets {
-			if name != "" && b.Cap > 0 && b.Remaining-b.Held > epsilon {
+		for _, b := range m.state.Buckets {
+			if b != destination && b.Cap > 0 && b.Remaining-b.Held > epsilon {
 				weight += b.Cap
 			}
 		}
@@ -465,8 +476,8 @@ func (m *Manager) Skim(amount float64) (float64, error) {
 			break
 		}
 		moved := 0.0
-		for name, b := range m.state.Buckets {
-			if name == "" || b.Cap <= 0 {
+		for _, b := range m.state.Buckets {
+			if b == destination || b.Cap <= 0 {
 				continue
 			}
 			take := math.Min(math.Max(0, b.Remaining-b.Held), left*b.Cap/weight)
@@ -477,7 +488,7 @@ func (m *Manager) Skim(amount float64) (float64, error) {
 			break
 		}
 		left -= moved
-		m.state.Buckets[""].Remaining += moved
+		destination.Remaining += moved
 	}
 	return amount - left, m.persistLocked()
 }

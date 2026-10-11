@@ -178,6 +178,20 @@ func codexQuotaProviders(providers []string) bool {
 	return false
 }
 func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (context.Context, cliproxyexecutor.Options, *sessionquota.Reservation, error) {
+	// Capture and remove all attribution/estimate headers even on non-budgeted
+	// routes. They are proxy-local metadata, not part of the upstream API.
+	session, _ := opts.Metadata[sessionquota.MetadataKey].(string)
+	if value := opts.Headers.Get(sessionquota.Header); value != "" {
+		session = value
+	}
+	inputHint, _ := strconv.ParseFloat(opts.Headers.Get(sessionquota.InputTokensHeader), 64)
+	cachedHint, _ := strconv.ParseFloat(opts.Headers.Get(sessionquota.CachedTokensHeader), 64)
+	if opts.Headers != nil {
+		opts.Headers = opts.Headers.Clone()
+		opts.Headers.Del(sessionquota.Header)
+		opts.Headers.Del(sessionquota.InputTokensHeader)
+		opts.Headers.Del(sessionquota.CachedTokensHeader)
+	}
 	q := m.SessionQuota()
 	if q == nil || !codexQuotaProviders(providers) {
 		return ctx, opts, nil, nil
@@ -186,15 +200,7 @@ func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req
 	if !q.HasAccounts() {
 		return ctx, opts, nil, nil
 	} // API-key Codex routes have no subscription pool.
-	session, _ := opts.Metadata[sessionquota.MetadataKey].(string)
-	if value := opts.Headers.Get(sessionquota.Header); value != "" {
-		session = value
-	}
-	if opts.Headers != nil {
-		opts.Headers = opts.Headers.Clone()
-		opts.Headers.Del(sessionquota.Header)
-	}
-	reservation, err := q.Reserve(session, sessionquota.EstimateTokens(req.Payload))
+	reservation, err := q.Reserve(session, sessionquota.EstimateTokensWithHints(req.Payload, inputHint, cachedHint))
 	if err != nil {
 		return ctx, opts, nil, err
 	}
@@ -215,6 +221,12 @@ func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req
 			accountID = sessionQuotaAccountID(auth)
 		}
 		reservation.Consume(accountID, tokens, noCharge)
+		// A successful usage record is the terminal model response, even if
+		// transport draining/EOF happens later. Release the unused allowance
+		// before the client starts tools; a tool phase is not an API request.
+		if !record.Failed {
+			reservation.Close(false)
+		}
 	})
 	return ctx, opts, reservation, nil
 }

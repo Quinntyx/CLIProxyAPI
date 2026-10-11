@@ -98,7 +98,8 @@ func (s *Server) sessionQuotaSkim(c *gin.Context) {
 		return
 	}
 	var body struct {
-		Amount *float64 `json:"amount"`
+		Amount  *float64 `json:"amount"`
+		Session string   `json:"session"`
 	}
 	if c.Request.Body != nil && c.Request.ContentLength != 0 {
 		if c.ShouldBindJSON(&body) != nil {
@@ -110,7 +111,7 @@ func (s *Server) sessionQuotaSkim(c *gin.Context) {
 	if body.Amount != nil {
 		amount = *body.Amount
 	}
-	moved, err := q.Skim(amount)
+	moved, err := q.SkimTo(body.Session, amount)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
