@@ -19,13 +19,22 @@ type RemainingQuotaWindow struct {
 	UnknownAccounts  int      `json:"unknown_accounts"`
 }
 
+// RemainingQuotaAccount describes only the account actually bound to this
+// session and model. No credential identifiers, emails or tokens are exposed.
+type RemainingQuotaAccount struct {
+	PlanType           string  `json:"plan_type"`
+	FiveHourCapPercent float64 `json:"five_hour_cap_percent"`
+	WeeklyCapPercent   float64 `json:"weekly_cap_percent"`
+}
+
 type RemainingQuotaStatus struct {
-	FiveHour          RemainingQuotaWindow `json:"five_hour"`
-	Weekly            RemainingQuotaWindow `json:"weekly"`
-	CurrentBinding    string               `json:"current_binding"`
-	RoutingAvailable  *bool                `json:"routing_available,omitempty"`
-	CurrentAvailable  *bool                `json:"current_available,omitempty"`
-	AvailableAccounts int                  `json:"available_accounts"`
+	CurrentAccount    *RemainingQuotaAccount `json:"current_account,omitempty"`
+	FiveHour          RemainingQuotaWindow   `json:"five_hour"`
+	Weekly            RemainingQuotaWindow   `json:"weekly"`
+	CurrentBinding    string                 `json:"current_binding"`
+	RoutingAvailable  *bool                  `json:"routing_available,omitempty"`
+	CurrentAvailable  *bool                  `json:"current_available,omitempty"`
+	AvailableAccounts int                    `json:"available_accounts"`
 }
 
 // RemainingQuota is read-only: it never selects an account, changes policies,
@@ -161,6 +170,13 @@ func (b *BurnController) remainingQuota(auths []*Auth, current *Auth, eligible m
 		return result
 	}
 	result := RemainingQuotaStatus{FiveHour: window("five_hour"), Weekly: window("weekly")}
+	if entry := accounts[currentKey]; current != nil && currentKey != "" && entry != nil {
+		result.CurrentAccount = &RemainingQuotaAccount{
+			PlanType:           codexAccountPlanType(current),
+			FiveHourCapPercent: entry.caps["five_hour"],
+			WeeklyCapPercent:   entry.caps["weekly"],
+		}
+	}
 	if eligible != nil {
 		for key, entry := range accounts {
 			if entry.ready {

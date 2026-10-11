@@ -505,13 +505,18 @@ func (s *BurnDeadlineSelector) Pick(ctx context.Context, provider, model string,
 	if err != nil {
 		return nil, err
 	}
+	forcedAvailable := false
 	if id != "" {
 		for _, a := range available {
 			if a.ID == id {
 				available = []*Auth{a}
+				forcedAvailable = true
 				break
 			}
 		}
+	}
+	if !forcedAvailable {
+		available = preferIdleCodexAccounts(available)
 	}
 	fallback := s.Fallback
 	if fallback == nil {
