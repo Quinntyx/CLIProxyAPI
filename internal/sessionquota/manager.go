@@ -84,6 +84,44 @@ type ExhaustedError struct {
 	Needed     float64
 }
 
+// RequestTooLargeError reports an admission that can never fit within the
+// selected session bucket. Unlike ExhaustedError, waiting for refill cannot
+// make this request affordable.
+type RequestTooLargeError struct {
+	Needed float64
+	Limit  float64
+}
+
+func (e *RequestTooLargeError) StatusCode() int       { return http.StatusRequestEntityTooLarge }
+func (e *RequestTooLargeError) IsRequestScoped() bool { return true }
+func (e *RequestTooLargeError) Headers() http.Header {
+	headers := http.Header{"X-Cliproxyapi-Quota-Code": []string{"request_too_large"}}
+	if e.Needed > 0 && finite(e.Needed) {
+		headers.Set("X-CLIProxyAPI-Quota-Required-Points", strconv.FormatFloat(e.Needed, 'g', -1, 64))
+	}
+	if e.Limit >= 0 && finite(e.Limit) {
+		headers.Set("X-CLIProxyAPI-Quota-Max-Points", strconv.FormatFloat(e.Limit, 'g', -1, 64))
+	}
+	return headers
+}
+func (e *RequestTooLargeError) Error() string {
+	details := map[string]any{
+		"code":      "context_too_large",
+		"type":      "invalid_request_error",
+		"message":   "Request exceeds the maximum provisioned admission size; reduce or compact the context",
+		"reason":    "session quota request too large",
+		"retryable": false,
+	}
+	if e.Needed > 0 && finite(e.Needed) {
+		details["required_points"] = e.Needed
+	}
+	if e.Limit >= 0 && finite(e.Limit) {
+		details["max_points"] = e.Limit
+	}
+	payload, _ := json.Marshal(map[string]any{"error": details})
+	return string(payload)
+}
+
 func (e *ExhaustedError) StatusCode() int { return 429 }
 func (e *ExhaustedError) Headers() http.Header {
 	code := "provisioned_quota_exhausted"
@@ -527,8 +565,30 @@ func (m *Manager) Reserve(session string, weightedTokens float64) (*Reservation,
 	if !finite(rate) {
 		rate = DefaultTokensPerPoint
 	}
-	points := math.Max(0.000001, weightedTokens/rate)
-	if !finite(points) || points > b.Remaining-b.Held+epsilon {
+	poolCapacity := 0.0
+	for _, a := range m.state.Accounts {
+		poolCapacity += a.Capacity
+	}
+	// A refill cannot exceed either the session cap or the subscription pool.
+	// Existing over-cap funds (explicit skims, including held funds) can still
+	// be spent once their in-flight reservations release them.
+	refillCap := b.Cap
+	if poolCapacity > epsilon {
+		refillCap = math.Min(refillCap, poolCapacity)
+	}
+	// A disabled subscription pool is a real quota boundary, not evidence
+	// that an otherwise ordinary payload needs context compaction.
+	limit := math.Max(refillCap, b.Remaining)
+	points := weightedTokens / rate
+	if !finite(points) {
+		return nil, &RequestTooLargeError{Needed: points, Limit: limit}
+	}
+	points = math.Max(0.000001, points)
+	available := b.Remaining - b.Held
+	if points > available+epsilon {
+		if points > limit+epsilon {
+			return nil, &RequestTooLargeError{Needed: points, Limit: limit}
+		}
 		return nil, &ExhaustedError{RetryAfter: m.retryLocked(), Needed: points}
 	}
 	b.Held += points

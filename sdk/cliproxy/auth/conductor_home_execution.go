@@ -241,6 +241,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			}
 			startHomeExec := time.Now()
 			response, errExecute = execute()
+			errExecute = normalizeRequestSizeError(errExecute)
 			errExecute = markUpstreamExecutionAttemptFromContext(execCtx, errExecute)
 			durationHomeExec := time.Since(startHomeExec)
 			if countTokens {

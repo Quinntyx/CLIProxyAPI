@@ -215,7 +215,7 @@ func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req
 		}
 		detail := record.Detail
 		tokens := sessionquota.WeightedTokens(detail.InputTokens, detail.OutputTokens, detail.CachedTokens, detail.CacheReadTokens, detail.CacheCreationTokens, detail.ReasoningTokens)
-		noCharge := record.Failed && (record.Fail.StatusCode == 400 || record.Fail.StatusCode == 401 || record.Fail.StatusCode == 403 || record.Fail.StatusCode == 404 || record.Fail.StatusCode == 429)
+		noCharge := record.Failed && noQuotaChargeStatus(record.Fail.StatusCode)
 		accountID := record.AuthID
 		if auth, ok := m.GetByID(record.AuthID); ok {
 			accountID = sessionQuotaAccountID(auth)
@@ -235,7 +235,7 @@ func (m *Manager) sessionQuotaError(err error) error {
 		return nil
 	}
 	var exhausted *sessionquota.ExhaustedError
-	if errors.As(err, &exhausted) {
+	if errors.As(err, &exhausted) || isRequestInvalidError(err) {
 		return err
 	}
 	q := m.SessionQuota()
@@ -269,8 +269,11 @@ func noQuotaCharge(err error) bool {
 	if errors.As(err, &exhausted) {
 		return true
 	}
-	status := clienterror.HTTPStatusFromError(err)
-	return status == 400 || status == 401 || status == 403 || status == 404 || status == 429
+	return noQuotaChargeStatus(clienterror.HTTPStatusFromError(err))
+}
+
+func noQuotaChargeStatus(status int) bool {
+	return status == 400 || status == 401 || status == 403 || status == 404 || status == 413 || status == 422 || status == 429
 }
 
 // Execute admits exactly once around all credential attempts and upstream retries.

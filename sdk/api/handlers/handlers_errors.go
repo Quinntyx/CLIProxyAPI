@@ -130,15 +130,22 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 	// Local quota metadata is part of the admission protocol, not upstream
-	// header passthrough. Only a concrete local error may supply these headers.
+	// header passthrough. Only concrete local errors may supply these headers.
+	var quotaBody string
 	if msg != nil && msg.Error != nil {
-		var quotaErr *sessionquota.ExhaustedError
-		if errors.As(msg.Error, &quotaErr) {
-			for key, values := range quotaErr.Headers() {
-				c.Writer.Header().Del(key)
-				for _, value := range values {
-					c.Writer.Header().Add(key, value)
-				}
+		var exhausted *sessionquota.ExhaustedError
+		var tooLarge *sessionquota.RequestTooLargeError
+		var quotaHeaders http.Header
+		switch {
+		case errors.As(msg.Error, &tooLarge):
+			quotaHeaders, quotaBody = tooLarge.Headers(), tooLarge.Error()
+		case errors.As(msg.Error, &exhausted):
+			quotaHeaders, quotaBody = exhausted.Headers(), exhausted.Error()
+		}
+		for key, values := range quotaHeaders {
+			c.Writer.Header().Del(key)
+			for _, value := range values {
+				c.Writer.Header().Add(key, value)
 			}
 		}
 	}
@@ -159,6 +166,10 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
 			errText = v
 		}
+	}
+
+	if quotaBody != "" {
+		errText = quotaBody
 	}
 
 	var errCause error

@@ -66,8 +66,8 @@ func TestSessionQuotaExecuteAccountsUsageAndRejectsInteractiveBeforeUpstream(t *
 		t.Fatal(b)
 	}
 	_, err = m.Execute(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
-	var exhausted *sessionquota.ExhaustedError
-	if !errors.As(err, &exhausted) || exhausted.Weekly || calls != 1 {
+	var tooLarge *sessionquota.RequestTooLargeError
+	if !errors.As(err, &tooLarge) || tooLarge.Needed <= tooLarge.Limit || calls != 1 {
 		t.Fatal(err, calls)
 	}
 }
@@ -340,5 +340,191 @@ func TestSessionQuotaFinalUsageReleasesHeldBeforeStreamEOF(t *testing.T) {
 	}
 	if math.Abs(quotaBucket(t, q, "workflow").Remaining-249.86) > 1e-6 {
 		t.Fatal("completion double billed")
+	}
+}
+
+func TestSessionQuotaRequestSizeErrorsReleaseReservation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		register func(*Manager)
+		invoke   func(*Manager, string) error
+	}{
+		{
+			name: "execute",
+			register: func(m *Manager) {
+				m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					return cliproxyexecutor.Response{}, errors.New("exceeded request buffer limit")
+				}})
+			},
+			invoke: func(m *Manager, model string) error {
+				_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hi","max_output_tokens":1000}`)}, cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}})
+				return err
+			},
+		},
+		{
+			name: "count tokens",
+			register: func(m *Manager) {
+				m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", countFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					return cliproxyexecutor.Response{}, errors.New("request exceeds the buffer limit")
+				}})
+			},
+			invoke: func(m *Manager, model string) error {
+				_, err := m.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hi","max_output_tokens":1000}`)}, cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}})
+				return err
+			},
+		},
+		{
+			name: "stream setup",
+			register: func(m *Manager) {
+				m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					return nil, errors.New("request buffer limit exceeded")
+				}})
+			},
+			invoke: func(m *Manager, model string) error {
+				_, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hi","max_output_tokens":1000}`)}, cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}})
+				return err
+			},
+		},
+		{
+			name: "stream bootstrap",
+			register: func(m *Manager) {
+				m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+					chunks <- cliproxyexecutor.StreamChunk{Err: errors.New("request body too large")}
+					close(chunks)
+					return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+				}})
+			},
+			invoke: func(m *Manager, model string) error {
+				_, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hi","max_output_tokens":1000}`)}, cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}})
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m, q, model := quotaManager(t)
+			if err := q.Set("workflow", 250); err != nil {
+				t.Fatal(err)
+			}
+			test.register(m)
+			err := test.invoke(m, model)
+			var sizeErr *requestSizeError
+			if !errors.As(err, &sizeErr) || sizeErr.StatusCode() != http.StatusRequestEntityTooLarge {
+				t.Fatalf("error = %T/%v, want requestSizeError", err, err)
+			}
+			b := quotaBucket(t, q, "workflow")
+			if b.Held != 0 || math.Abs(b.Remaining-250) > 1e-6 {
+				t.Fatalf("reservation leaked or charged: %+v", b)
+			}
+		})
+	}
+}
+
+func TestSessionQuotaImpossibleAdmissionNeverContactsUpstream(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			m, q, model := quotaManager(t)
+			if err := q.Set("workflow", 1); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			if streaming {
+				m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					calls++
+					return nil, errors.New("must not contact upstream")
+				}})
+			} else {
+				m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					calls++
+					return cliproxyexecutor.Response{}, errors.New("must not contact upstream")
+				}})
+			}
+			req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hello","max_output_tokens":10000}`)}
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}}
+			var err error
+			if streaming {
+				_, err = m.ExecuteStream(context.Background(), []string{"codex"}, req, opts)
+			} else {
+				_, err = m.Execute(context.Background(), []string{"codex"}, req, opts)
+			}
+			var tooLarge *sessionquota.RequestTooLargeError
+			if !errors.As(err, &tooLarge) || calls != 0 || tooLarge.Headers().Get("Retry-After") != "" {
+				t.Fatalf("impossible admission was retried/contacted upstream: %T/%v calls=%d", err, err, calls)
+			}
+			if b := quotaBucket(t, q, "workflow"); b.Held != 0 || b.Remaining != 1 {
+				t.Fatalf("rejected admission changed bucket: %+v", b)
+			}
+			if b := quotaBucket(t, q, ""); b.Held != 0 || b.Remaining != 249 {
+				t.Fatalf("rejected admission borrowed protected quota: %+v", b)
+			}
+		})
+	}
+}
+
+func TestSessionQuotaPayloadFaultIsNotConvertedToWeeklyWait(t *testing.T) {
+	m, q, _ := quotaManager(t)
+	q.Sync([]sessionquota.Observation{{ID: "quota-auth-" + t.Name(), Capacity: 250, Known: true, WeeklyExhausted: true, ObservedAt: time.Now().Add(time.Second)}})
+	original := normalizeRequestSizeError(errors.New("exceeded request buffer limit"))
+	if err := m.sessionQuotaError(original); err != original {
+		t.Fatalf("non-refillable payload error converted to quota wait: %T/%v", err, err)
+	}
+}
+
+func TestSessionQuotaCancellationSettlesStreamUsageAndReleasesHold(t *testing.T) {
+	for _, measured := range []bool{false, true} {
+		t.Run(fmt.Sprint(measured), func(t *testing.T) {
+			m, q, model := quotaManager(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			payload := []byte(`{"input":"hello","max_output_tokens":1000}`)
+			m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(ctx context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+				chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+				chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: started\n\n")}
+				go func() {
+					defer close(chunks)
+					<-ctx.Done()
+					if measured {
+						usage.PublishRecord(ctx, usage.Record{Provider: "codex", AuthID: a.ID, Failed: true, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 100}})
+					}
+				}()
+				return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+			}})
+			stream, err := m.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			<-stream.Chunks
+			if b := quotaBucket(t, q, ""); b.Held <= 0 {
+				t.Fatalf("in-flight admission missing: %+v", b)
+			}
+			cancel()
+			for range stream.Chunks {
+			}
+			cost := sessionquota.EstimateTokens(payload) / sessionquota.DefaultTokensPerPoint
+			if measured {
+				cost = 0.14
+			}
+			if b := quotaBucket(t, q, ""); b.Held != 0 || math.Abs(b.Remaining-(250-cost)) > 1e-6 {
+				t.Fatalf("cancellation leaked hold/lost consumption: %+v want cost=%v", b, cost)
+			}
+		})
+	}
+}
+
+func TestSessionQuotaNoChargeUsageRecordPreventsFallbackCharge(t *testing.T) {
+	for _, status := range []int{413, 422} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			m, q, model := quotaManager(t)
+			m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(ctx context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				usage.PublishRecord(ctx, usage.Record{Provider: "codex", AuthID: a.ID, Failed: true, Fail: usage.Failure{StatusCode: status}})
+				// The usage record, not the transport's terminal error, owns known
+				// no-charge accounting when the connection breaks during cleanup.
+				return cliproxyexecutor.Response{}, errors.New("transport closed after rejection")
+			}})
+			_, _ = m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			if b := quotaBucket(t, q, ""); b.Held != 0 || b.Remaining != 250 {
+				t.Fatalf("known no-charge record billed fallback: %+v", b)
+			}
+		})
 	}
 }

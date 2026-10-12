@@ -203,6 +203,41 @@ func TestWeeklyExhaustionTerminatesRatherThanLocalWait(t *testing.T) {
 	near(t, q.Snapshot().TotalRemaining, 0)
 	invariant(t, q)
 }
+
+func TestImpossibleAdmissionIsRequestScopedInsteadOfRefillable(t *testing.T) {
+	q := ledger(t, 26.975)
+	_, err := q.Reserve("", 2965850)
+	var tooLarge *RequestTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("Reserve() error = %T/%v, want RequestTooLargeError", err, err)
+	}
+	if tooLarge.StatusCode() != 413 || tooLarge.Needed <= tooLarge.Limit {
+		t.Fatalf("unexpected request-too-large details: %+v", tooLarge)
+	}
+	if got := tooLarge.Headers().Get("X-CLIProxyAPI-Quota-Code"); got != "request_too_large" {
+		t.Fatalf("quota code = %q", got)
+	}
+	var scoped interface{ IsRequestScoped() bool }
+	if !errors.As(err, &scoped) || !scoped.IsRequestScoped() {
+		t.Fatal("request-too-large admission was not request scoped")
+	}
+	near(t, bucket(t, q, "").Held, 0)
+	near(t, bucket(t, q, "").Remaining, 26.975)
+}
+
+func TestAffordableFutureAdmissionRemainsRefillable(t *testing.T) {
+	q := ledger(t, 25)
+	_, err := q.Reserve("", 1000000)
+	var exhausted *ExhaustedError
+	if !errors.As(err, &exhausted) || exhausted.Weekly {
+		t.Fatalf("Reserve() error = %T/%v, want refillable ExhaustedError", err, err)
+	}
+	var tooLarge *RequestTooLargeError
+	if errors.As(err, &tooLarge) {
+		t.Fatalf("future-affordable request misclassified: %+v", tooLarge)
+	}
+	near(t, bucket(t, q, "").Held, 0)
+}
 func TestStaleWatermarksDoNotUndoPredictedReset(t *testing.T) {
 	q, _ := New("")
 	now := time.Now()
@@ -352,4 +387,55 @@ func TestQuotaResponseHeadersRetainAdmissionIdentity(t *testing.T) {
 			t.Fatalf("required points %q", got)
 		}
 	}
+}
+
+func TestOverCapHeldFundsRemainRefillable(t *testing.T) {
+	q := ledger(t, 250)
+	if err := q.Set("workflow", 50); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.SkimTo("workflow", 100); err != nil {
+		t.Fatal(err)
+	}
+	r, err := q.Reserve("workflow", 1000000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = q.Reserve("workflow", 1000000)
+	var exhausted *ExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("held funds can release: got %T/%v, want refillable exhaustion", err, err)
+	}
+	r.Close(true)
+	r, err = q.Reserve("workflow", 1000000)
+	if err != nil {
+		t.Fatalf("released over-cap funds not spendable: %v", err)
+	}
+	r.Close(true)
+	invariant(t, q)
+}
+
+func TestAdmissionCannotOutwaitSubscriptionPoolCapacity(t *testing.T) {
+	q := ledger(t, 100)
+	q.Sync([]Observation{{ID: "a", Capacity: 100, Known: true, Remaining: 100, ObservedAt: time.Now().Add(time.Second)}})
+	_, err := q.Reserve("", 1000001)
+	var tooLarge *RequestTooLargeError
+	if !errors.As(err, &tooLarge) || tooLarge.Limit != 100 {
+		t.Fatalf("got %T/%v, want pool-bounded impossible admission", err, err)
+	}
+	near(t, bucket(t, q, "").Held, 0)
+	invariant(t, q)
+}
+
+func TestNonFiniteAdmissionIsNonRefillable(t *testing.T) {
+	q := ledger(t, 250)
+	for _, tokens := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		_, err := q.Reserve("", tokens)
+		var tooLarge *RequestTooLargeError
+		if !errors.As(err, &tooLarge) || tooLarge.Headers().Get("Retry-After") != "" || !json.Valid([]byte(tooLarge.Error())) {
+			t.Fatalf("non-finite admission: %T/%v", err, err)
+		}
+	}
+	near(t, bucket(t, q, "").Held, 0)
+	invariant(t, q)
 }
