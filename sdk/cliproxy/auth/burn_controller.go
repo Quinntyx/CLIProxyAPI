@@ -416,11 +416,11 @@ func (b *BurnController) chooseForcedLocked(auths []*Auth, now time.Time) string
 	}
 	var deadline time.Time
 	for _, a := range auths {
-		if a == nil || a.Provider != "codex" || a.Disabled || !b.capPermitsLocked(a, now) {
+		if a == nil || a.Provider != "codex" || a.Disabled || a.Status == StatusDisabled || !b.capPermitsLocked(a, now) {
 			continue
 		}
 		state := b.accounts[b.key(a.ID)]
-		if state == nil {
+		if state == nil || !b.burnWeekPermitsLocked(state, now) {
 			continue
 		}
 		effective := b.effectiveLocked(a, now)
@@ -429,7 +429,7 @@ func (b *BurnController) chooseForcedLocked(auths []*Auth, now time.Time) string
 			continue
 		}
 		for kind, w := range state.Windows {
-			if w == nil || !w.Reset.After(now) || now.Sub(w.Observed) > b.maxAge() || w.CalibrationSamples < 2 || w.PercentPerToken <= 0 {
+			if w == nil || w.Closed || w.Observed.IsZero() || w.Observed.After(now.Add(time.Minute)) || !w.Reset.After(now) || now.Sub(w.Observed) > b.maxAge() || w.CalibrationSamples < 2 || w.PercentPerToken <= 0 {
 				continue
 			}
 			ceiling := 100.0
@@ -460,7 +460,21 @@ func (b *BurnController) forcedEligibleLocked(auths []*Auth, now time.Time) stri
 	}
 	if b.forcedReset.After(now) {
 		for _, a := range auths {
-			if a != nil && a.ID == b.forced && !a.Disabled && b.capPermitsLocked(a, now) {
+			if a != nil && a.Provider == "codex" && a.ID == b.forced && !a.Disabled && a.Status != StatusDisabled && b.capPermitsLocked(a, now) {
+				state := b.accounts[b.key(a.ID)]
+				if state == nil || !b.burnWeekPermitsLocked(state, now) {
+					continue
+				}
+				windowValid := false
+				for _, w := range state.Windows {
+					if w != nil && w.Reset.Equal(b.forcedReset) && !w.Closed && !w.Observed.IsZero() && !w.Observed.After(now.Add(time.Minute)) && now.Sub(w.Observed) <= b.maxAge() && w.CalibrationSamples >= 2 && w.PercentPerToken > 0 && w.Used < 100 {
+						windowValid = true
+						break
+					}
+				}
+				if !windowValid {
+					continue
+				}
 				effective := b.effectiveLocked(a, now)
 				weight, _ := resetPressureWeight(effective, "codex", now)
 				if weight > 0 {
@@ -792,4 +806,10 @@ func (b *BurnController) projectedTokens(a *BurnAccount, kind string, tps float6
 		available = cap / other.PercentPerToken
 	}
 	return total
+}
+
+// A forced five-hour burn never grants an escape from an exhausted weekly pool.
+func (b *BurnController) burnWeekPermitsLocked(state *BurnAccount, now time.Time) bool {
+	w := state.Windows["weekly"]
+	return w != nil && !w.Closed && !w.Observed.IsZero() && !w.Observed.After(now.Add(time.Minute)) && now.Sub(w.Observed) <= b.maxAge() && w.Reset.After(now) && w.Used < 100
 }

@@ -134,11 +134,8 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	var quotaBody string
 	if msg != nil && msg.Error != nil {
 		var exhausted *sessionquota.ExhaustedError
-		var tooLarge *sessionquota.RequestTooLargeError
 		var quotaHeaders http.Header
 		switch {
-		case errors.As(msg.Error, &tooLarge):
-			quotaHeaders, quotaBody = tooLarge.Headers(), tooLarge.Error()
 		case errors.As(msg.Error, &exhausted):
 			quotaHeaders, quotaBody = exhausted.Headers(), exhausted.Error()
 		}

@@ -78,6 +78,7 @@ type credentialPolicyContextKey struct{}
 
 type authSelectionEligibility struct {
 	sessionQuota     *sessionquota.Manager
+	forcedBurn       *sessionQuotaBurnLease
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
@@ -103,6 +104,7 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
 	if ctx != nil {
 		eligibility.sessionQuota, _ = ctx.Value(sessionQuotaContextKey{}).(*sessionquota.Manager)
+		eligibility.forcedBurn, _ = ctx.Value(sessionQuotaBurnKey{}).(*sessionQuotaBurnLease)
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
 	}
@@ -111,6 +113,9 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 
 func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if auth == nil {
+		return false
+	}
+	if e.forcedBurn != nil && !e.forcedBurn.permits(auth) {
 		return false
 	}
 	if e.sessionQuota != nil && canonicalSchedulingProvider(auth.Provider) == "codex" && !e.sessionQuota.EligibleAccount(sessionQuotaAccountID(auth)) {

@@ -41,13 +41,13 @@ func invariant(t *testing.T, q *Manager) {
 	caps, remaining := 0.0, 0.0
 	for _, b := range s.Buckets {
 		caps += b.Cap
-		remaining += b.Remaining
+		remaining += b.Remaining - b.Debt
 		if b.Cap < 0 || b.Remaining < 0 || b.Held < 0 || b.Available < 0 {
 			t.Fatal(b)
 		}
 	}
 	near(t, caps, 250)
-	near(t, remaining, s.TotalRemaining)
+	near(t, math.Max(0, remaining), s.TotalRemaining)
 	q.mu.Lock()
 	pool := q.poolLocked()
 	q.mu.Unlock()
@@ -129,7 +129,7 @@ func TestSkimRedistributesDryDonorAndReportsShortfall(t *testing.T) {
 	near(t, moved, 42)
 	invariant(t, q)
 }
-func TestSkimAndCapCommandsCannotTakeHeldQuota(t *testing.T) {
+func TestSkimAndClearDoNotEstimateActiveRequests(t *testing.T) {
 	q := ledger(t, 100)
 	_ = q.Set("x", 100)
 	r, err := q.Reserve("x", 900000)
@@ -137,17 +137,20 @@ func TestSkimAndCapCommandsCannotTakeHeldQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	moved, _ := q.Skim(100)
-	near(t, moved, 10)
-	near(t, bucket(t, q, "x").Held, 90)
+	near(t, moved, 100)
+	near(t, bucket(t, q, "x").Held, 0)
 	_ = q.Clear("x")
-	near(t, bucket(t, q, "").Remaining, 10)
+	near(t, bucket(t, q, "").Remaining, 100)
 	r.Close(true)
+	r.ConsumeRecord("late", "a", 20000, false)
+	near(t, bucket(t, q, "x").Debt, 2)
 	near(t, bucket(t, q, "").Remaining, 100)
 	invariant(t, q)
 }
+
 func TestAtomicAdmissionConcurrent(t *testing.T) {
-	q := ledger(t, 5)
-	_ = q.Set("x", 5)
+	q := ledger(t, .25)
+	_ = q.Set("x", .25)
 	reservations := make(chan *Reservation, 100)
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -161,10 +164,12 @@ func TestAtomicAdmissionConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 	close(reservations)
-	if len(reservations) != 5 {
+	if len(reservations) != 1 {
 		t.Fatalf("admitted %d", len(reservations))
 	}
-	near(t, bucket(t, q, "x").Held, 5)
+	if bucket(t, q, "x").InFlight != 1 || bucket(t, q, "x").AdmissionReady {
+		t.Fatal(bucket(t, q, "x"))
+	}
 	for r := range reservations {
 		r.Close(true)
 	}
@@ -184,11 +189,11 @@ func TestCompletionUsesActualUsageAndNoChargeReleasesReservation(t *testing.T) {
 	near(t, bucket(t, q, "x").Remaining, 98)
 	invariant(t, q)
 }
-func TestUnknownConsumptionKeepsConservativeCharge(t *testing.T) {
+func TestUnknownConsumptionIsNotEstimatedCharge(t *testing.T) {
 	q := ledger(t, 100)
 	r, _ := q.Reserve("", 50000)
 	r.Close(false)
-	near(t, bucket(t, q, "").Remaining, 95)
+	near(t, bucket(t, q, "").Remaining, 100)
 	near(t, bucket(t, q, "").Held, 0)
 	invariant(t, q)
 }
@@ -204,40 +209,38 @@ func TestWeeklyExhaustionTerminatesRatherThanLocalWait(t *testing.T) {
 	invariant(t, q)
 }
 
-func TestImpossibleAdmissionIsRequestScopedInsteadOfRefillable(t *testing.T) {
-	q := ledger(t, 26.975)
-	_, err := q.Reserve("", 2965850)
-	var tooLarge *RequestTooLargeError
-	if !errors.As(err, &tooLarge) {
-		t.Fatalf("Reserve() error = %T/%v, want RequestTooLargeError", err, err)
+func TestTinyCreditIgnoresPayloadAllowance(t *testing.T) {
+	q := ledger(t, .000001)
+	r, err := q.Reserve("", 2965850000000)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if tooLarge.StatusCode() != 413 || tooLarge.Needed <= tooLarge.Limit {
-		t.Fatalf("unexpected request-too-large details: %+v", tooLarge)
+	if bucket(t, q, "").InFlight != 1 {
+		t.Fatal(bucket(t, q, ""))
 	}
-	if got := tooLarge.Headers().Get("X-CLIProxyAPI-Quota-Code"); got != "request_too_large" {
-		t.Fatalf("quota code = %q", got)
-	}
-	var scoped interface{ IsRequestScoped() bool }
-	if !errors.As(err, &scoped) || !scoped.IsRequestScoped() {
-		t.Fatal("request-too-large admission was not request scoped")
-	}
-	near(t, bucket(t, q, "").Held, 0)
-	near(t, bucket(t, q, "").Remaining, 26.975)
+	r.Close(false)
+	near(t, bucket(t, q, "").Remaining, .000001)
 }
 
-func TestAffordableFutureAdmissionRemainsRefillable(t *testing.T) {
+func TestFundedRequestsKeepNormalConcurrency(t *testing.T) {
 	q := ledger(t, 25)
-	_, err := q.Reserve("", 1000000)
-	var exhausted *ExhaustedError
-	if !errors.As(err, &exhausted) || exhausted.Weekly {
-		t.Fatalf("Reserve() error = %T/%v, want refillable ExhaustedError", err, err)
+	var requests []*Reservation
+	for i := 0; i < 100; i++ {
+		r, err := q.Reserve("", 100000000000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, r)
 	}
-	var tooLarge *RequestTooLargeError
-	if errors.As(err, &tooLarge) {
-		t.Fatalf("future-affordable request misclassified: %+v", tooLarge)
+	if bucket(t, q, "").InFlight != 100 || !bucket(t, q, "").AdmissionReady {
+		t.Fatal(bucket(t, q, ""))
 	}
-	near(t, bucket(t, q, "").Held, 0)
+	for _, r := range requests {
+		r.Close(false)
+	}
+	invariant(t, q)
 }
+
 func TestStaleWatermarksDoNotUndoPredictedReset(t *testing.T) {
 	q, _ := New("")
 	now := time.Now()
@@ -276,7 +279,7 @@ func TestCoarseUnchangedWatermarksKeepTokenEstimatesForCalibration(t *testing.T)
 	near(t, rate, 8200)
 	invariant(t, q)
 }
-func TestPersistedCapsAndCrashReservationsFailConservatively(t *testing.T) {
+func TestPersistedCapsAndCrashedSlotsDoNotInventCharges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	q, err := New(path)
 	if err != nil {
@@ -293,7 +296,7 @@ func TestPersistedCapsAndCrashReservationsFailConservatively(t *testing.T) {
 		t.Fatal(err)
 	}
 	near(t, bucket(t, restored, "x").Cap, 100)
-	near(t, bucket(t, restored, "x").Remaining, 97)
+	near(t, bucket(t, restored, "x").Remaining, 100)
 	near(t, bucket(t, restored, "x").Held, 0)
 	invariant(t, restored)
 }
@@ -344,38 +347,31 @@ func TestAccountCapNormalizationDoesNotHideConsumption(t *testing.T) {
 func TestTokenSubsetsAreNotDoubleCounted(t *testing.T) {
 	near(t, WeightedTokens(100, 50, 80, 80, 0, 40), 228)
 	near(t, WeightedTokens(0, 0, 0, 0, 0, 25), 100)
-	if EstimateTokens([]byte(`{"input":"hi","max_output_tokens":100}`)) >= EstimateTokens([]byte(`{"input":"hi","max_output_tokens":200}`)) {
-		t.Fatal("output allowance ignored")
-	}
 }
 
-func TestAdmissionFailureReportsRequiredPoints(t *testing.T) {
-	q := ledger(t, 0.25)
+func TestEmptyCreditErrorHasNoRequestCost(t *testing.T) {
+	q := ledger(t, 0)
 	_, err := q.Reserve("unregistered", DefaultTokensPerPoint)
 	var exhausted *ExhaustedError
 	if !errors.As(err, &exhausted) {
-		t.Fatalf("expected provisioned quota error, got %v", err)
+		t.Fatal(err)
 	}
-	near(t, exhausted.Needed, 1)
-	var body struct {
-		Error struct {
-			Code     string  `json:"code"`
-			Required float64 `json:"required_points"`
-		} `json:"error"`
-	}
+	var body map[string]any
 	if err := json.Unmarshal([]byte(exhausted.Error()), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Error.Code != "provisioned_quota_exhausted" {
+	if _, ok := body["error"].(map[string]any)["required_points"]; ok {
 		t.Fatal(body)
 	}
-	near(t, body.Error.Required, 1)
+	if exhausted.Headers().Get("X-CLIProxyAPI-Quota-Required-Points") != "" {
+		t.Fatal(exhausted.Headers())
+	}
 	invariant(t, q)
 }
 
 func TestQuotaResponseHeadersRetainAdmissionIdentity(t *testing.T) {
 	for _, weekly := range []bool{false, true} {
-		err := &ExhaustedError{Weekly: weekly, RetryAfter: 60, Needed: 0.125}
+		err := &ExhaustedError{Weekly: weekly, RetryAfter: 60}
 		code := "provisioned_quota_exhausted"
 		if weekly {
 			code = "weekly_quota_exhausted"
@@ -383,60 +379,49 @@ func TestQuotaResponseHeadersRetainAdmissionIdentity(t *testing.T) {
 		if got := err.Headers().Get("X-CLIProxyAPI-Quota-Code"); got != code {
 			t.Fatalf("code %q, want %q", got, code)
 		}
-		if got := err.Headers().Get("X-CLIProxyAPI-Quota-Required-Points"); got != "0.125" {
+		if got := err.Headers().Get("X-CLIProxyAPI-Quota-Required-Points"); got != "" {
 			t.Fatalf("required points %q", got)
 		}
 	}
 }
 
-func TestOverCapHeldFundsRemainRefillable(t *testing.T) {
+func TestSkimmedOverCapCreditKeepsConcurrency(t *testing.T) {
 	q := ledger(t, 250)
-	if err := q.Set("workflow", 50); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := q.SkimTo("workflow", 100); err != nil {
-		t.Fatal(err)
-	}
+	_ = q.Set("workflow", 50)
+	_, _ = q.SkimTo("workflow", 100)
 	r, err := q.Reserve("workflow", 1000000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = q.Reserve("workflow", 1000000)
-	var exhausted *ExhaustedError
-	if !errors.As(err, &exhausted) {
-		t.Fatalf("held funds can release: got %T/%v, want refillable exhaustion", err, err)
-	}
-	r.Close(true)
-	r, err = q.Reserve("workflow", 1000000)
+	r2, err := q.Reserve("workflow", 1000000)
 	if err != nil {
-		t.Fatalf("released over-cap funds not spendable: %v", err)
+		t.Fatal(err)
 	}
-	r.Close(true)
+	r.Close(false)
+	r2.Close(false)
 	invariant(t, q)
 }
 
-func TestAdmissionCannotOutwaitSubscriptionPoolCapacity(t *testing.T) {
+func TestAdmissionDoesNotUsePoolAsRequestSizeLimit(t *testing.T) {
 	q := ledger(t, 100)
 	q.Sync([]Observation{{ID: "a", Capacity: 100, Known: true, Remaining: 100, ObservedAt: time.Now().Add(time.Second)}})
-	_, err := q.Reserve("", 1000001)
-	var tooLarge *RequestTooLargeError
-	if !errors.As(err, &tooLarge) || tooLarge.Limit != 100 {
-		t.Fatalf("got %T/%v, want pool-bounded impossible admission", err, err)
+	r, err := q.Reserve("", 10000000000)
+	if err != nil {
+		t.Fatal(err)
 	}
-	near(t, bucket(t, q, "").Held, 0)
+	r.Close(false)
 	invariant(t, q)
 }
 
-func TestNonFiniteAdmissionIsNonRefillable(t *testing.T) {
+func TestObsoleteCostHintIsNotAdmissionAuthority(t *testing.T) {
 	q := ledger(t, 250)
 	for _, tokens := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		_, err := q.Reserve("", tokens)
-		var tooLarge *RequestTooLargeError
-		if !errors.As(err, &tooLarge) || tooLarge.Headers().Get("Retry-After") != "" || !json.Valid([]byte(tooLarge.Error())) {
-			t.Fatalf("non-finite admission: %T/%v", err, err)
+		r, err := q.Reserve("", tokens)
+		if err != nil {
+			t.Fatal(err)
 		}
+		r.Close(false)
 	}
-	near(t, bucket(t, q, "").Held, 0)
 	invariant(t, q)
 }
 

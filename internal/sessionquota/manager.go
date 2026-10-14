@@ -22,13 +22,20 @@ const MetadataKey = "tmux_quota_session"
 const DefaultTokensPerPoint = 10000.0
 const epsilon = 1e-8
 
-// Bucket.Remaining includes Held. Only Available may be reassigned or admitted.
+// NearEmptyPoints is a fixed concurrency floor, never a request-cost estimate.
+const NearEmptyPoints = 1.0
+
+// Remaining is a signed durable balance internally; snapshots expose nonnegative
+// credit and separate debt. Held is retained for wire compatibility and is zero.
 type Bucket struct {
-	Session   string  `json:"session"`
-	Cap       float64 `json:"cap"`
-	Remaining float64 `json:"remaining"`
-	Held      float64 `json:"held"`
-	Available float64 `json:"available"`
+	Session        string  `json:"session"`
+	Cap            float64 `json:"cap"`
+	Remaining      float64 `json:"remaining"`
+	Held           float64 `json:"held"`
+	Available      float64 `json:"available"`
+	Debt           float64 `json:"debt"`
+	InFlight       int     `json:"in_flight"`
+	AdmissionReady bool    `json:"admission_ready"`
 }
 type Account struct {
 	ID                     string    `json:"id"`
@@ -56,19 +63,31 @@ type Observation struct {
 	WeeklyResetAt      time.Time
 	WeeklyExhausted    bool
 }
+
+// ForcedBurn exposes a short-lived routing capability without credential identity.
+type ForcedBurn struct {
+	Eligible  bool      `json:"eligible"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+}
+
 type Snapshot struct {
-	Capacity           float64  `json:"capacity"`
-	TotalRemaining     float64  `json:"total_remaining"`
-	AllWeeklyExhausted bool     `json:"all_weekly_exhausted"`
-	Buckets            []Bucket `json:"buckets"`
-	RetryAfterSeconds  int      `json:"retry_after_seconds"`
-	Estimated          bool     `json:"estimated"`
-	PersistenceError   string   `json:"persistence_error,omitempty"`
+	AdmissionMode      string     `json:"admission_mode"`
+	NearEmptyPoints    float64    `json:"near_empty_points"`
+	ForcedBurn         ForcedBurn `json:"forced_burn"`
+	Capacity           float64    `json:"capacity"`
+	TotalRemaining     float64    `json:"total_remaining"`
+	AllWeeklyExhausted bool       `json:"all_weekly_exhausted"`
+	Buckets            []Bucket   `json:"buckets"`
+	RetryAfterSeconds  int        `json:"retry_after_seconds"`
+	Estimated          bool       `json:"estimated"`
+	PersistenceError   string     `json:"persistence_error,omitempty"`
 }
 type state struct {
 	Version  int                 `json:"version"`
 	Buckets  map[string]*Bucket  `json:"buckets"`
 	Accounts map[string]*Account `json:"accounts"`
+	// Per-account window deductions are private durable bookkeeping, never public credential IDs.
+	Penalties map[string]map[string]float64 `json:"refill_penalties,omitempty"`
 }
 type Manager struct {
 	mu               sync.Mutex
@@ -76,50 +95,12 @@ type Manager struct {
 	path             string
 	now              func() time.Time
 	persistenceError error
+	forcedBurn       ForcedBurn
 }
 
 type ExhaustedError struct {
 	Weekly     bool
 	RetryAfter int
-	Needed     float64
-}
-
-// RequestTooLargeError reports an admission that can never fit within the
-// selected session bucket. Unlike ExhaustedError, waiting for refill cannot
-// make this request affordable.
-type RequestTooLargeError struct {
-	Needed float64
-	Limit  float64
-}
-
-func (e *RequestTooLargeError) StatusCode() int       { return http.StatusRequestEntityTooLarge }
-func (e *RequestTooLargeError) IsRequestScoped() bool { return true }
-func (e *RequestTooLargeError) Headers() http.Header {
-	headers := http.Header{"X-Cliproxyapi-Quota-Code": []string{"request_too_large"}}
-	if e.Needed > 0 && finite(e.Needed) {
-		headers.Set("X-CLIProxyAPI-Quota-Required-Points", strconv.FormatFloat(e.Needed, 'g', -1, 64))
-	}
-	if e.Limit >= 0 && finite(e.Limit) {
-		headers.Set("X-CLIProxyAPI-Quota-Max-Points", strconv.FormatFloat(e.Limit, 'g', -1, 64))
-	}
-	return headers
-}
-func (e *RequestTooLargeError) Error() string {
-	details := map[string]any{
-		"code":      "context_too_large",
-		"type":      "invalid_request_error",
-		"message":   "Request exceeds the maximum provisioned admission size; reduce or compact the context",
-		"reason":    "session quota request too large",
-		"retryable": false,
-	}
-	if e.Needed > 0 && finite(e.Needed) {
-		details["required_points"] = e.Needed
-	}
-	if e.Limit >= 0 && finite(e.Limit) {
-		details["max_points"] = e.Limit
-	}
-	payload, _ := json.Marshal(map[string]any{"error": details})
-	return string(payload)
 }
 
 func (e *ExhaustedError) StatusCode() int { return 429 }
@@ -133,9 +114,6 @@ func (e *ExhaustedError) Headers() http.Header {
 		"X-Cliproxyapi-Quota-Code":        []string{code},
 		"X-Cliproxyapi-Quota-Retry-After": []string{strconv.Itoa(e.RetryAfter)},
 	}
-	if e.Needed > 0 && finite(e.Needed) {
-		headers.Set("X-CLIProxyAPI-Quota-Required-Points", strconv.FormatFloat(e.Needed, 'g', -1, 64))
-	}
 	return headers
 }
 func (e *ExhaustedError) Error() string {
@@ -146,15 +124,12 @@ func (e *ExhaustedError) Error() string {
 	// "quota exceeded" prevents native Codex HTTP retries; the Pi extension
 	// owns the asynchronous admission wait instead.
 	details := map[string]any{"code": code, "type": code, "message": message, "reason": "quota exceeded", "retry_after_seconds": e.RetryAfter}
-	if e.Needed > 0 && finite(e.Needed) {
-		details["required_points"] = e.Needed
-	}
 	payload, _ := json.Marshal(map[string]any{"error": details})
 	return string(payload)
 }
 
 func New(path string) (*Manager, error) {
-	m := &Manager{path: path, now: time.Now, state: state{Version: 1, Buckets: map[string]*Bucket{"": {Session: "", Cap: Capacity}}, Accounts: make(map[string]*Account)}}
+	m := &Manager{path: path, now: time.Now, state: state{Version: 2, Buckets: map[string]*Bucket{"": {Session: "", Cap: Capacity}}, Accounts: make(map[string]*Account), Penalties: make(map[string]map[string]float64)}}
 	if path == "" {
 		return m, nil
 	}
@@ -168,32 +143,40 @@ func New(path string) (*Manager, error) {
 	if err = json.Unmarshal(data, &m.state); err != nil {
 		return nil, fmt.Errorf("invalid session quota state: %w", err)
 	}
-	if m.state.Version != 1 || m.state.Buckets == nil || m.state.Accounts == nil || m.state.Buckets[""] == nil {
+	if (m.state.Version != 1 && m.state.Version != 2) || m.state.Buckets == nil || m.state.Accounts == nil || m.state.Buckets[""] == nil {
 		return nil, errors.New("unsupported session quota state")
 	}
 	for id, a := range m.state.Accounts {
-		if a == nil || !finite(a.Capacity) || !finite(a.Remaining) || !finite(a.ObservedRemaining) || !finite(a.TokensPerPoint) || !finite(a.TokensSinceObservation) || a.Capacity <= 0 || a.Capacity > Capacity || a.Remaining < 0 || a.Remaining > a.Capacity+epsilon || a.TokensPerPoint <= 0 || a.TokensSinceObservation < 0 {
+		if a == nil || !finite(a.Capacity) || !finite(a.Remaining) || !finite(a.ObservedRemaining) || !finite(a.TokensPerPoint) || !finite(a.TokensSinceObservation) || a.Capacity < 0 || a.Capacity > Capacity || (m.state.Version == 1 && a.Remaining < 0) || a.Remaining > a.Capacity+epsilon || a.TokensPerPoint <= 0 || a.TokensSinceObservation < 0 {
 			return nil, errors.New("invalid session quota account")
 		}
 		a.ID = id
 	}
 	caps := 0.0
 	for name, b := range m.state.Buckets {
-		if b == nil || !finite(b.Cap) || !finite(b.Remaining) || !finite(b.Held) || b.Cap < 0 || b.Remaining < 0 || b.Held < 0 {
+		if b == nil || !finite(b.Cap) || !finite(b.Remaining) || !finite(b.Held) || b.Cap < 0 || (m.state.Version == 1 && b.Remaining < 0) || b.Held < 0 {
 			return nil, errors.New("invalid session quota bucket")
 		}
 		b.Session = name
 		caps += b.Cap
-		// A crashed request has unknown consumption. Keep its reservation charged until
-		// a fresh upstream observation reconciles the discrepancy; never refund blindly.
-		stranded := math.Min(b.Remaining, b.Held)
-		b.Remaining -= stranded
-		b.Held = 0
-		m.debitAccountsLocked(stranded)
+		// Old estimates and crashed slots are not reported usage. Migration and
+		// restart release them without fabricating a charge.
+		b.Held, b.InFlight, b.Debt, b.AdmissionReady = 0, 0, 0, false
 	}
 	if math.Abs(caps-Capacity) > epsilon {
 		return nil, errors.New("session quota caps must sum to 250")
 	}
+	if m.state.Penalties == nil {
+		m.state.Penalties = make(map[string]map[string]float64)
+	}
+	for _, deductions := range m.state.Penalties {
+		for name, amount := range deductions {
+			if m.state.Buckets[name] == nil || !finite(amount) || amount < 0 || amount > Capacity {
+				return nil, errors.New("invalid session quota refill penalty")
+			}
+		}
+	}
+	m.state.Version = 2
 	m.reconcileLocked(m.poolLocked())
 	return m, nil
 }
@@ -235,7 +218,9 @@ func (m *Manager) poolLocked() float64 {
 	total := 0.0
 	for _, a := range m.state.Accounts {
 		if !a.WeeklyExhausted {
-			total += math.Max(0, a.Remaining)
+			total += a.Remaining
+		} else {
+			total += math.Min(0, a.Remaining)
 		}
 	}
 	return math.Min(Capacity, total)
@@ -255,6 +240,7 @@ func (m *Manager) advanceLocked() {
 			a.WeeklyResetAt = time.Time{}
 		}
 		if !a.ResetAt.IsZero() && !now.Before(a.ResetAt) {
+			m.refillWindowLocked(a.ID)
 			a.Remaining = a.Capacity
 			a.ObservedRemaining = a.Capacity
 			a.TokensSinceObservation = 0
@@ -273,22 +259,37 @@ func (m *Manager) reconcileLocked(target float64) {
 	if math.Abs(delta) <= epsilon {
 		return
 	}
-	if delta < 0 && total > 0 {
+	if delta < 0 {
+		// External corrections remain proportional to positive balances. Never
+		// redistribute one session's overrun: its signed debit already matches
+		// the account debit before reconciliation.
+		positive := 0.0
 		for _, b := range m.state.Buckets {
-			b.Remaining = math.Max(0, b.Remaining*(target/total))
+			positive += math.Max(0, b.Remaining)
+		}
+		if positive > 0 {
+			for _, b := range m.state.Buckets {
+				if b.Remaining > 0 {
+					b.Remaining += delta * b.Remaining / positive
+				}
+			}
 		}
 		return
 	}
 	deficits := 0.0
 	for _, b := range m.state.Buckets {
-		deficits += math.Max(0, b.Cap-b.Remaining)
+		deficits += m.refillDeficitLocked(b)
 	}
-	if deficits <= epsilon {
-		return
+	if deficits > epsilon {
+		grant := math.Min(delta, deficits)
+		for _, b := range m.state.Buckets {
+			b.Remaining += grant * m.refillDeficitLocked(b) / deficits
+		}
+		delta -= grant
 	}
-	for _, b := range m.state.Buckets {
-		b.Remaining += delta * math.Max(0, b.Cap-b.Remaining) / deficits
-	}
+	// Repayment never enlarges the debtor's deficit share. Unassigned funds
+	// belong to interactive treasury, not to another named budget.
+	m.state.Buckets[""].Remaining += delta
 }
 func (m *Manager) Sync(observations []Observation) {
 	m.mu.Lock()
@@ -340,6 +341,12 @@ func (m *Manager) Sync(observations []Observation) {
 			if finite(observedRate) && observedRate > 0 {
 				a.TokensPerPoint = math.Max(100, math.Min(10000000, 0.8*a.TokensPerPoint+0.2*observedRate))
 			}
+		}
+		// A confirmed rollover can arrive before a predicted reset is observed.
+		// A post-prediction watermark (ResetAt cleared above) only confirms the
+		// new window and must not settle the same penalty twice.
+		if !a.ObservedAt.IsZero() && math.Abs(a.Capacity-cap) <= epsilon && ((!a.ResetAt.IsZero() && o.ResetAt.After(a.ResetAt)) || (a.ResetAt.IsZero() && remaining >= cap-epsilon && a.ObservedRemaining < cap-epsilon)) {
+			m.refillWindowLocked(a.ID)
 		}
 		plateau := math.Abs(a.ObservedRemaining-remaining) <= epsilon && math.Abs(a.Capacity-cap) <= epsilon && a.WeeklyExhausted == o.WeeklyExhausted && (a.ResetAt.IsZero() || a.ResetAt.Equal(o.ResetAt))
 		a.Capacity = cap
@@ -393,7 +400,8 @@ func (m *Manager) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.advanceLocked()
-	snapshot := Snapshot{Capacity: Capacity, TotalRemaining: m.totalLocked(), AllWeeklyExhausted: m.weeklyLocked(), RetryAfterSeconds: m.retryLocked(), Estimated: true}
+	burn := m.forcedBurnLocked()
+	snapshot := Snapshot{AdmissionMode: "soft", NearEmptyPoints: NearEmptyPoints, ForcedBurn: burn, Capacity: Capacity, TotalRemaining: math.Max(0, m.totalLocked()), AllWeeklyExhausted: m.weeklyLocked(), RetryAfterSeconds: m.retryLocked(), Estimated: true}
 	names := make([]string, 0, len(m.state.Buckets))
 	for name := range m.state.Buckets {
 		names = append(names, name)
@@ -401,7 +409,13 @@ func (m *Manager) Snapshot() Snapshot {
 	sort.Strings(names)
 	for _, name := range names {
 		b := *m.state.Buckets[name]
-		b.Available = math.Max(0, b.Remaining-b.Held)
+		if name != "" && b.Cap == 0 && b.Remaining == 0 && b.InFlight == 0 {
+			continue
+		}
+		b.Debt = math.Max(0, -b.Remaining)
+		b.Remaining = math.Max(0, b.Remaining)
+		b.Available = b.Remaining
+		b.AdmissionReady = !snapshot.AllWeeklyExhausted && (burn.Eligible || (b.Remaining > 0 && (b.Remaining > NearEmptyPoints || b.InFlight == 0)))
 		snapshot.Buckets = append(snapshot.Buckets, b)
 	}
 	if m.persistenceError != nil {
@@ -437,7 +451,10 @@ func (m *Manager) Set(name string, cap float64) error {
 		old.Remaining -= release
 		interactive.Remaining += release
 	}
-	need := math.Max(0, cap-old.Remaining)
+	need := math.Max(0, m.refillCeilingLocked(old)-math.Max(0, old.Remaining))
+	if old.Remaining < 0 {
+		need = 0
+	}
 	grant := math.Min(need, math.Max(0, interactive.Remaining-interactive.Held))
 	old.Remaining += grant
 	interactive.Remaining -= grant
@@ -456,9 +473,7 @@ func (m *Manager) Clear(name string) error {
 		release := math.Max(0, b.Remaining-b.Held)
 		b.Remaining -= release
 		interactive.Remaining += release
-		if b.Held <= epsilon {
-			delete(m.state.Buckets, name)
-		}
+		// Keep a tombstone for debt and late request records; clear is not forgiveness.
 	}
 	return m.persistLocked()
 }
@@ -475,9 +490,7 @@ func (m *Manager) ClearAll() error {
 		release := math.Max(0, b.Remaining-b.Held)
 		interactive.Remaining += release
 		b.Remaining -= release
-		if b.Held <= epsilon {
-			delete(m.state.Buckets, name)
-		}
+		// Keep a tombstone for debt and late request records; clear is not forgiveness.
 	}
 	return m.persistLocked()
 }
@@ -499,7 +512,7 @@ func (m *Manager) SkimTo(session string, amount float64) (float64, error) {
 	defer m.mu.Unlock()
 	m.advanceLocked()
 	destination := m.state.Buckets[session]
-	if destination == nil || destination.Cap <= 0 {
+	if destination == nil {
 		destination = m.state.Buckets[""]
 	}
 	left := amount
@@ -542,15 +555,33 @@ func (m *Manager) SkimTo(session string, amount float64) (float64, error) {
 // Reservation is one atomic admission covering all attempts in a client request.
 // Methods are serialized by the owning Manager lock, including concurrent records.
 type Reservation struct {
-	manager     *Manager
-	bucket      *Bucket
-	held        float64
-	accounted   bool
-	closed      bool
-	lastAccount string
+	manager *Manager
+	bucket  *Bucket
+	closed  bool
+	records map[string]float64
 }
 
-func (m *Manager) Reserve(session string, weightedTokens float64) (*Reservation, error) {
+// SetForcedBurn publishes only a validated, routable capability from the auth manager.
+// Admission passes its own request-specific capability; this snapshot is not authority.
+func (m *Manager) SetForcedBurn(burn ForcedBurn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forcedBurn = burn
+}
+func (m *Manager) forcedBurnLocked() ForcedBurn {
+	burn := m.forcedBurn
+	if !burn.Eligible || !burn.ExpiresAt.After(m.now()) {
+		return ForcedBurn{}
+	}
+	return burn
+}
+
+// Reserve admits by credit, not by payload cost. The ignored argument is kept
+// for source compatibility with embedders; no monetary estimate is evaluated.
+func (m *Manager) Reserve(session string, _ float64) (*Reservation, error) {
+	return m.ReserveRequest(session, false)
+}
+func (m *Manager) ReserveRequest(session string, forcedBurn bool) (*Reservation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.advanceLocked()
@@ -558,51 +589,16 @@ func (m *Manager) Reserve(session string, weightedTokens float64) (*Reservation,
 		return nil, &ExhaustedError{Weekly: true, RetryAfter: m.retryLocked()}
 	}
 	b := m.state.Buckets[session]
-	if b == nil || b.Cap <= 0 {
+	if b == nil || (b.Cap <= 0 && b.Remaining >= 0 && b.InFlight == 0) {
 		b = m.state.Buckets[""]
 	}
-	// Reserve against the least favorable calibration among accounts that can
-	// actually serve this request. A default-rate floor (or an exhausted account)
-	// must not erase learned efficiency from the usable subscription pool.
-	rate := math.Inf(1)
-	for _, a := range m.state.Accounts {
-		if !a.WeeklyExhausted && a.Remaining > epsilon && finite(a.TokensPerPoint) && a.TokensPerPoint > 0 {
-			rate = math.Min(rate, a.TokensPerPoint)
-		}
+	if !forcedBurn && (b.Remaining <= 0 || (b.Remaining <= NearEmptyPoints && b.InFlight > 0)) {
+		return nil, &ExhaustedError{RetryAfter: m.retryLocked()}
 	}
-	if !finite(rate) {
-		rate = DefaultTokensPerPoint
-	}
-	poolCapacity := 0.0
-	for _, a := range m.state.Accounts {
-		poolCapacity += a.Capacity
-	}
-	// A refill cannot exceed either the session cap or the subscription pool.
-	// Existing over-cap funds (explicit skims, including held funds) can still
-	// be spent once their in-flight reservations release them.
-	refillCap := b.Cap
-	if poolCapacity > epsilon {
-		refillCap = math.Min(refillCap, poolCapacity)
-	}
-	// A disabled subscription pool is a real quota boundary, not evidence
-	// that an otherwise ordinary payload needs context compaction.
-	limit := math.Max(refillCap, b.Remaining)
-	points := weightedTokens / rate
-	if !finite(points) {
-		return nil, &RequestTooLargeError{Needed: points, Limit: limit}
-	}
-	points = math.Max(0.000001, points)
-	available := b.Remaining - b.Held
-	if points > available+epsilon {
-		if points > limit+epsilon {
-			return nil, &RequestTooLargeError{Needed: points, Limit: limit}
-		}
-		return nil, &ExhaustedError{RetryAfter: m.retryLocked(), Needed: points}
-	}
-	b.Held += points
-	r := &Reservation{manager: m, bucket: b, held: points}
+	b.InFlight++
+	r := &Reservation{manager: m, bucket: b, records: make(map[string]float64)}
 	if err := m.persistLocked(); err != nil {
-		b.Held -= points
+		b.InFlight--
 		return nil, fmt.Errorf("persist session quota admission: %w", err)
 	}
 	return r, nil
@@ -611,62 +607,61 @@ func (m *Manager) debitAccountsLocked(points float64) {
 	total := 0.0
 	for _, a := range m.state.Accounts {
 		if !a.WeeklyExhausted {
-			total += a.Remaining
+			total += math.Max(0, a.Remaining)
 		}
 	}
-	if total <= epsilon {
+	if total <= 0 {
 		return
 	}
 	for _, a := range m.state.Accounts {
-		if !a.WeeklyExhausted {
-			a.Remaining = math.Max(0, a.Remaining-points*a.Remaining/total)
+		if !a.WeeklyExhausted && a.Remaining > 0 {
+			a.Remaining -= points * a.Remaining / total
 		}
 	}
 }
 
-// Consume replaces reservation estimates with observed token usage. Reasoning
-// is already contained in output tokens; cached input is contained in input.
+// Consume records a single execution; repeated cumulative usage is idempotent.
 func (r *Reservation) Consume(authID string, weightedTokens float64, knownNoCharge bool) {
-	if r == nil {
+	r.ConsumeRecord("", authID, weightedTokens, knownNoCharge)
+}
+
+// ConsumeRecord remains valid after Close/cancellation. Each execution ID has a
+// cumulative high watermark, so late known usage is retained without double debit.
+// A failed/unknown record cannot erase a preceding actual measurement.
+func (r *Reservation) ConsumeRecord(recordID, authID string, weightedTokens float64, _ bool) {
+	if r == nil || !finite(weightedTokens) || weightedTokens <= 0 {
 		return
 	}
 	m := r.manager
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r.closed {
+	previous := r.records[recordID]
+	if weightedTokens <= previous {
 		return
 	}
-	r.lastAccount = authID
-	if knownNoCharge {
-		r.accounted = true
-	}
-	if weightedTokens <= 0 {
-		return
-	}
-	r.accounted = true
+	r.records[recordID] = weightedTokens
+	tokens := weightedTokens - previous
 	rate := DefaultTokensPerPoint
 	if a := m.state.Accounts[authID]; a != nil {
 		if a.TokensPerPoint > 0 {
 			rate = a.TokensPerPoint
 		}
-		a.TokensSinceObservation += weightedTokens
+		a.TokensSinceObservation += tokens
 	}
-	cost := weightedTokens / rate
+	cost := tokens / rate
 	if a := m.state.Accounts[authID]; a != nil {
-		a.Remaining = math.Max(0, a.Remaining-cost)
+		a.Remaining -= cost
 	} else {
 		m.debitAccountsLocked(cost)
 	}
-	r.bucket.Remaining = math.Max(0, r.bucket.Remaining-cost)
-	released := math.Min(r.held, cost)
-	r.held -= released
-	r.bucket.Held = math.Max(0, r.bucket.Held-released)
-	// An underestimated charge cannot create money. Authoritative pool corrections
-	// account for overruns across the pool while future admissions remain guarded.
-	m.reconcileLocked(m.poolLocked())
+	// Signed balance carries the entire overrun against THIS session. It never
+	// clamps the debit and reconciles the remainder against other allocations.
+	r.bucket.Remaining -= cost
 	_ = m.persistLocked()
 }
-func (r *Reservation) Close(noCharge bool) {
+
+// Close releases the request slot only. Missing usage is not an estimated bill.
+func (r *Reservation) Close(_ bool) {
 	if r == nil {
 		return
 	}
@@ -677,20 +672,77 @@ func (r *Reservation) Close(noCharge bool) {
 		return
 	}
 	r.closed = true
-	if !r.accounted && !noCharge {
-		r.bucket.Remaining = math.Max(0, r.bucket.Remaining-r.held)
-		if a := m.state.Accounts[r.lastAccount]; a != nil {
-			a.Remaining = math.Max(0, a.Remaining-r.held)
-		} else {
-			m.debitAccountsLocked(r.held)
+	r.bucket.InFlight--
+	_ = m.persistLocked()
+}
+
+func (m *Manager) refillCeilingLocked(b *Bucket) float64 {
+	penalty := 0.0
+	for _, deductions := range m.state.Penalties {
+		penalty += deductions[b.Session]
+	}
+	return math.Max(0, b.Cap-penalty)
+}
+
+// Each credential's new window pays a proportional part of the debtor's next
+// normal allocation, rather than adding debt to its refill deficit. Deductions
+// survive restarts/plateau observations and expire only on that credential's
+// following rollover. Large overruns take multiple owner refills to repay.
+func (m *Manager) refillWindowLocked(accountID string) {
+	if m.state.Penalties == nil {
+		m.state.Penalties = make(map[string]map[string]float64)
+	}
+	expired := 0.0
+	for _, amount := range m.state.Penalties[accountID] {
+		expired += amount
+	}
+	interactive := m.state.Buckets[""]
+	interactive.Remaining -= math.Min(expired, math.Max(0, interactive.Remaining-interactive.Cap))
+	capacity := 0.0
+	for _, a := range m.state.Accounts {
+		capacity += a.Capacity
+	}
+	share := 0.0
+	if a := m.state.Accounts[accountID]; a != nil && capacity > 0 {
+		share = a.Capacity / capacity
+	}
+	deductions := make(map[string]float64)
+	for name, b := range m.state.Buckets {
+		repayment := math.Min(math.Max(0, -b.Remaining), b.Cap*share)
+		if repayment > 0 {
+			b.Remaining += repayment
+			if name != "" {
+				interactive.Remaining -= math.Min(repayment, math.Max(0, interactive.Remaining-interactive.Cap))
+			}
+			deductions[name] = repayment
 		}
 	}
-	r.bucket.Held = math.Max(0, r.bucket.Held-r.held)
-	r.held = 0
-	if r.bucket.Cap <= 0 && r.bucket.Session != "" && r.bucket.Held <= epsilon {
-		m.state.Buckets[""].Remaining += r.bucket.Remaining
-		delete(m.state.Buckets, r.bucket.Session)
+	m.state.Penalties[accountID] = deductions
+	// A previous partial rollover can leave unassigned repayment treasury
+	// backing a still-negative owner. Return only its over-cap surplus when
+	// the next proportional owner grant completes repayment.
+	deficits := 0.0
+	for name, b := range m.state.Buckets {
+		if name != "" {
+			deficits += m.refillDeficitLocked(b)
+		}
 	}
-	m.reconcileLocked(m.poolLocked())
-	_ = m.persistLocked()
+	if deficits > epsilon {
+		grant := math.Min(deficits, math.Max(0, interactive.Remaining-interactive.Cap))
+		for name, b := range m.state.Buckets {
+			if name != "" {
+				b.Remaining += grant * m.refillDeficitLocked(b) / deficits
+			}
+		}
+		interactive.Remaining -= grant
+	}
+}
+func (m *Manager) refillDeficitLocked(b *Bucket) float64 {
+	// Unpaid carry debt cannot enlarge an ordinary refill share or be silently
+	// repaid again by the same window. Only the next owner's normal grant (or
+	// an explicitly authorized targeted skim) may settle it.
+	if b.Remaining < 0 {
+		return 0
+	}
+	return math.Max(0, m.refillCeilingLocked(b)-b.Remaining)
 }

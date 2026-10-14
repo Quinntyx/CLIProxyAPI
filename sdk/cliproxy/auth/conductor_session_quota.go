@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/sessionquota"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -168,6 +169,12 @@ func (m *Manager) SyncSessionQuota() {
 		accounts = append(accounts, o)
 	}
 	q.Sync(accounts)
+	lease := m.routableForcedBurn(context.Background(), "", cliproxyexecutor.Options{})
+	burn := sessionquota.ForcedBurn{}
+	if lease != nil {
+		burn.Eligible, burn.ExpiresAt = true, lease.reset
+	}
+	q.SetForcedBurn(burn)
 }
 func codexQuotaProviders(providers []string) bool {
 	for _, provider := range providers {
@@ -178,14 +185,12 @@ func codexQuotaProviders(providers []string) bool {
 	return false
 }
 func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (context.Context, cliproxyexecutor.Options, *sessionquota.Reservation, error) {
-	// Capture and remove all attribution/estimate headers even on non-budgeted
+	// Capture and remove attribution and obsolete hint headers even on non-budgeted
 	// routes. They are proxy-local metadata, not part of the upstream API.
 	session, _ := opts.Metadata[sessionquota.MetadataKey].(string)
 	if value := opts.Headers.Get(sessionquota.Header); value != "" {
 		session = value
 	}
-	inputHint, _ := strconv.ParseFloat(opts.Headers.Get(sessionquota.InputTokensHeader), 64)
-	cachedHint, _ := strconv.ParseFloat(opts.Headers.Get(sessionquota.CachedTokensHeader), 64)
 	if opts.Headers != nil {
 		opts.Headers = opts.Headers.Clone()
 		opts.Headers.Del(sessionquota.Header)
@@ -200,7 +205,8 @@ func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req
 	if !q.HasAccounts() {
 		return ctx, opts, nil, nil
 	} // API-key Codex routes have no subscription pool.
-	reservation, err := q.Reserve(session, sessionquota.EstimateTokensWithHints(req.Payload, inputHint, cachedHint))
+	lease := m.routableForcedBurn(ctx, req.Model, opts)
+	reservation, err := q.ReserveRequest(session, lease != nil)
 	if err != nil {
 		return ctx, opts, nil, err
 	}
@@ -208,6 +214,15 @@ func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req
 		ctx = context.Background()
 	}
 	ctx = context.WithValue(ctx, sessionQuotaContextKey{}, q)
+	if lease != nil {
+		ctx = context.WithValue(ctx, sessionQuotaBurnKey{}, lease)
+		metadata := make(map[string]any, len(opts.Metadata)+1)
+		for key, value := range opts.Metadata {
+			metadata[key] = value
+		}
+		metadata[cliproxyexecutor.PinnedAuthMetadataKey] = lease.id
+		opts.Metadata = metadata
+	}
 	ctx = usage.WithRecordObserver(ctx, func(_ context.Context, record usage.Record) {
 		if canonicalSchedulingProvider(record.Provider) != "codex" {
 			reservation.Consume("", 0, true)
@@ -220,9 +235,9 @@ func (m *Manager) admitSessionQuota(ctx context.Context, providers []string, req
 		if auth, ok := m.GetByID(record.AuthID); ok {
 			accountID = sessionQuotaAccountID(auth)
 		}
-		reservation.Consume(accountID, tokens, noCharge)
+		reservation.ConsumeRecord(record.RequestID, accountID, tokens, noCharge)
 		// A successful usage record is the terminal model response, even if
-		// transport draining/EOF happens later. Release the unused allowance
+		// transport draining/EOF happens later. Release the request slot
 		// before the client starts tools; a tool phase is not an API request.
 		if !record.Failed {
 			reservation.Close(false)
@@ -285,14 +300,16 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if reservation == nil {
 		return m.executeWithoutSessionQuota(ctx, providers, req, opts)
 	}
+	stopCancel := context.AfterFunc(ctx, func() { reservation.Close(false) })
+	defer stopCancel()
 	defer m.SyncSessionQuota()
 	response, err := m.executeWithoutSessionQuota(ctx, providers, req, opts)
 	reservation.Close(noQuotaCharge(err))
 	return response, m.sessionQuotaError(err)
 }
 
-// ExecuteStream keeps admission held until the producer finishes, including
-// client cancellation. EOF cannot race the synchronous usage observer.
+// ExecuteStream releases admission on cancellation or terminal usage/EOF.
+// Late usage remains billable even if the upstream producer never closes.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	ctx, opts, reservation, err := m.admitSessionQuota(ctx, providers, req, opts)
 	if err != nil {
@@ -301,8 +318,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if reservation == nil {
 		return m.executeStreamWithoutSessionQuota(ctx, providers, req, opts)
 	}
+	stopCancel := context.AfterFunc(ctx, func() { reservation.Close(false) })
 	result, err := m.executeStreamWithoutSessionQuota(ctx, providers, req, opts)
 	if err != nil || result == nil || result.Chunks == nil {
+		stopCancel()
 		reservation.Close(noQuotaCharge(err))
 		m.SyncSessionQuota()
 		return result, m.sessionQuotaError(err)
@@ -313,8 +332,19 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	go func() {
 		var terminal error
 		defer close(output)
+		defer stopCancel()
 		defer func() { reservation.Close(noQuotaCharge(terminal)); m.SyncSessionQuota() }()
-		for chunk := range result.Chunks {
+		for {
+			var chunk cliproxyexecutor.StreamChunk
+			select {
+			case <-ctx.Done():
+				return
+			case value, ok := <-result.Chunks:
+				if !ok {
+					return
+				}
+				chunk = value
+			}
 			if chunk.Err != nil {
 				terminal = chunk.Err
 				chunk.Err = m.sessionQuotaError(chunk.Err)
@@ -322,8 +352,122 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			select {
 			case output <- chunk:
 			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 	return &wrapped, nil
+}
+
+// A burn lease is request-local authority, not a user-controlled flag. Selection
+// must revalidate it; pinning forbids fallback to any other credential.
+type sessionQuotaBurnKey struct{}
+type sessionQuotaBurnLease struct {
+	controller *BurnController
+	id         string
+	reset      time.Time
+}
+
+func (l *sessionQuotaBurnLease) permits(a *Auth) bool {
+	if l == nil || a == nil || a.ID != l.id {
+		return false
+	}
+	b := l.controller
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	return b.cfg.Enabled && b.forced == l.id && b.forcedReset.Equal(l.reset) && l.reset.After(now) && b.forcedEligibleLocked([]*Auth{a}, now) == l.id
+}
+
+// routableForcedBurn chooses a genuine burn target over the currently routable
+// subscription pool. Model/options-specific admission validates that SAME
+// target; it does not select a replacement merely to bypass a session budget.
+func (m *Manager) routableForcedBurn(ctx context.Context, model string, opts cliproxyexecutor.Options) *sessionQuotaBurnLease {
+	m.mu.RLock()
+	selector, ok := m.selector.(*BurnDeadlineSelector)
+	_, executorOK := m.executorLocked("codex")
+	m.mu.RUnlock()
+	if !ok || !executorOK {
+		return nil
+	}
+	b := selector.Controller
+	if b == nil {
+		b = DefaultBurnController
+	}
+	q := m.SessionQuota()
+	if q == nil {
+		return nil
+	}
+	models := registry.GetGlobalRegistry()
+	now := b.now()
+	var candidates []*Auth
+	for _, a := range m.List() {
+		if a == nil || a.Provider != "codex" || a.Disabled || a.Status == StatusDisabled || a.AuthKind() == AuthKindAPIKey || !q.EligibleAccount(sessionQuotaAccountID(a)) {
+			continue
+		}
+		// The public capability requires at least one registered, usable route.
+		for _, info := range models.GetModelsForClient(a.ID) {
+			if info == nil {
+				continue
+			}
+			if blocked, _, _ := isAuthBlockedForModelState(a, m.selectionModelForAuth(a, info.ID), now); !blocked {
+				candidates = append(candidates, a)
+				break
+			}
+		}
+	}
+	b.mu.Lock()
+	for _, a := range candidates {
+		b.ensureIdentity(a)
+		state := b.account(a.ID)
+		b.setPolicy(a, state)
+		b.observeLocked(a.ID, state, a.Quota, now)
+	}
+	id := b.chooseForcedLocked(candidates, now)
+	reset := b.forcedReset
+	b.mu.Unlock()
+	if id == "" || !reset.After(now) {
+		return nil
+	}
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	pinned := pinnedAuthIDFromMetadata(opts.Metadata)
+	for _, a := range candidates {
+		if a.ID != id || (pinned != "" && pinned != id) || !eligibility.allows(a) {
+			continue
+		}
+		if model != "" {
+			if !m.authSupportsRouteModel(models, a, model) {
+				return nil
+			}
+			if blocked, _, _ := isAuthBlockedForModelState(a, m.selectionModelForAuth(a, model), now); blocked {
+				return nil
+			}
+		}
+		lease := &sessionQuotaBurnLease{controller: b, id: id, reset: reset}
+		if lease.permits(a) {
+			return lease
+		}
+	}
+	return nil
+}
+
+// SessionQuotaSnapshot optionally scopes forced-burn readiness to a request model.
+// Public clients should query their actual model; omitting it describes whether
+// any route can use the forced target, not a promise about every model.
+func (m *Manager) SessionQuotaSnapshot(model string) sessionquota.Snapshot {
+	q := m.SessionQuota()
+	if q == nil {
+		return sessionquota.Snapshot{}
+	}
+	m.SyncSessionQuota()
+	snapshot := q.Snapshot()
+	snapshot.ForcedBurn = sessionquota.ForcedBurn{}
+	if lease := m.routableForcedBurn(context.Background(), model, cliproxyexecutor.Options{}); lease != nil {
+		snapshot.ForcedBurn = sessionquota.ForcedBurn{Eligible: true, ExpiresAt: lease.reset}
+	}
+	for i := range snapshot.Buckets {
+		b := &snapshot.Buckets[i]
+		b.AdmissionReady = !snapshot.AllWeeklyExhausted && (snapshot.ForcedBurn.Eligible || (b.Available > 0 && (b.Available > sessionquota.NearEmptyPoints || b.InFlight == 0)))
+	}
+	return snapshot
 }

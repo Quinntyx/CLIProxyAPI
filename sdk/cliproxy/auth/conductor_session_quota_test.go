@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,8 +67,8 @@ func TestSessionQuotaExecuteAccountsUsageAndRejectsInteractiveBeforeUpstream(t *
 		t.Fatal(b)
 	}
 	_, err = m.Execute(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
-	var tooLarge *sessionquota.RequestTooLargeError
-	if !errors.As(err, &tooLarge) || tooLarge.Needed <= tooLarge.Limit || calls != 1 {
+	var exhausted *sessionquota.ExhaustedError
+	if !errors.As(err, &exhausted) || exhausted.Weekly || calls != 1 {
 		t.Fatal(err, calls)
 	}
 }
@@ -420,42 +421,54 @@ func TestSessionQuotaRequestSizeErrorsReleaseReservation(t *testing.T) {
 	}
 }
 
-func TestSessionQuotaImpossibleAdmissionNeverContactsUpstream(t *testing.T) {
+func TestSessionQuotaTinyCreditHugePayloadContactsUpstream(t *testing.T) {
 	for _, streaming := range []bool{false, true} {
 		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
 			m, q, model := quotaManager(t)
-			if err := q.Set("workflow", 1); err != nil {
+			if err := q.Set("workflow", .000001); err != nil {
 				t.Fatal(err)
 			}
 			calls := 0
+			check := func(ctx context.Context, a *Auth, req cliproxyexecutor.Request) {
+				calls++
+				if len(req.Payload) < 1000000 {
+					t.Fatal("payload was compacted")
+				}
+				usage.PublishRecord(ctx, usage.Record{Provider: "codex", AuthID: a.ID, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 100}})
+			}
+			m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(ctx context.Context, a *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				check(ctx, a, req)
+				return cliproxyexecutor.Response{}, nil
+			}})
 			if streaming {
-				m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-					calls++
-					return nil, errors.New("must not contact upstream")
-				}})
-			} else {
-				m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-					calls++
-					return cliproxyexecutor.Response{}, errors.New("must not contact upstream")
+				m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(ctx context.Context, a *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					check(ctx, a, req)
+					chunks := make(chan cliproxyexecutor.StreamChunk)
+					close(chunks)
+					return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 				}})
 			}
-			req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hello","max_output_tokens":10000}`)}
+			req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"` + strings.Repeat("x", 1000000) + `","max_output_tokens":100000000}`)}
 			opts := cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}}
-			var err error
 			if streaming {
-				_, err = m.ExecuteStream(context.Background(), []string{"codex"}, req, opts)
-			} else {
-				_, err = m.Execute(context.Background(), []string{"codex"}, req, opts)
+				result, err := m.ExecuteStream(context.Background(), []string{"codex"}, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for range result.Chunks {
+				}
+			} else if _, err := m.Execute(context.Background(), []string{"codex"}, req, opts); err != nil {
+				t.Fatal(err)
 			}
-			var tooLarge *sessionquota.RequestTooLargeError
-			if !errors.As(err, &tooLarge) || calls != 0 || tooLarge.Headers().Get("Retry-After") != "" {
-				t.Fatalf("impossible admission was retried/contacted upstream: %T/%v calls=%d", err, err, calls)
+			if calls != 1 {
+				t.Fatal(calls)
 			}
-			if b := quotaBucket(t, q, "workflow"); b.Held != 0 || b.Remaining != 1 {
-				t.Fatalf("rejected admission changed bucket: %+v", b)
+			b := quotaBucket(t, q, "workflow")
+			if math.Abs(b.Debt-(.14-.000001)) > 1e-6 || b.Remaining != 0 || b.InFlight != 0 {
+				t.Fatal(b)
 			}
-			if b := quotaBucket(t, q, ""); b.Held != 0 || b.Remaining != 249 {
-				t.Fatalf("rejected admission borrowed protected quota: %+v", b)
+			if b := quotaBucket(t, q, ""); math.Abs(b.Remaining-(250-.000001)) > 1e-6 {
+				t.Fatal("stole interactive credit", b)
 			}
 		})
 	}
@@ -470,42 +483,61 @@ func TestSessionQuotaPayloadFaultIsNotConvertedToWeeklyWait(t *testing.T) {
 	}
 }
 
-func TestSessionQuotaCancellationSettlesStreamUsageAndReleasesHold(t *testing.T) {
+func TestSessionQuotaCancellationReleasesSlotWithoutProducerEOFAndBillsLateUsage(t *testing.T) {
 	for _, measured := range []bool{false, true} {
 		t.Run(fmt.Sprint(measured), func(t *testing.T) {
 			m, q, model := quotaManager(t)
+			_ = q.Set("workflow", .25)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			payload := []byte(`{"input":"hello","max_output_tokens":1000}`)
+			var execution context.Context
+			var authID string
+			// This producer deliberately never closes. No drain/EOF is needed to release.
 			m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(ctx context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+				execution = ctx
+				authID = a.ID
 				chunks := make(chan cliproxyexecutor.StreamChunk, 1)
 				chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: started\n\n")}
-				go func() {
-					defer close(chunks)
-					<-ctx.Done()
-					if measured {
-						usage.PublishRecord(ctx, usage.Record{Provider: "codex", AuthID: a.ID, Failed: true, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 100}})
-					}
-				}()
 				return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 			}})
-			stream, err := m.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{})
+			stream, err := m.ExecuteStream(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hi"}`)}, cliproxyexecutor.Options{Metadata: map[string]any{sessionquota.MetadataKey: "workflow"}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			<-stream.Chunks
-			if b := quotaBucket(t, q, ""); b.Held <= 0 {
-				t.Fatalf("in-flight admission missing: %+v", b)
+			if b := quotaBucket(t, q, "workflow"); b.InFlight != 1 || b.AdmissionReady {
+				t.Fatal(b)
 			}
 			cancel()
-			for range stream.Chunks {
+			select {
+			case _, ok := <-stream.Chunks:
+				if ok {
+					t.Fatal("unexpected chunk")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancel waited for upstream EOF")
 			}
-			cost := sessionquota.EstimateTokens(payload) / sessionquota.DefaultTokensPerPoint
+			b := quotaBucket(t, q, "workflow")
+			if b.InFlight != 0 || b.Remaining != .25 || !b.AdmissionReady {
+				t.Fatal(b)
+			}
 			if measured {
-				cost = 0.14
+				record := usage.Record{RequestID: "late", Provider: "codex", AuthID: authID, Failed: true, Detail: usage.Detail{InputTokens: 3000, OutputTokens: 100}}
+				usage.PublishRecord(execution, record)
+				usage.PublishRecord(execution, record)
+				b = quotaBucket(t, q, "workflow")
+				if b.InFlight != 0 || math.Abs(b.Debt-.09) > 1e-6 {
+					t.Fatal("late debit missing/doubled", b)
+				}
+				record.Detail.InputTokens = 4000
+				usage.PublishRecord(execution, record)
+				b = quotaBucket(t, q, "workflow")
+				if math.Abs(b.Debt-.19) > 1e-6 {
+					t.Fatal("late cumulative delta missing", b)
+				}
 			}
-			if b := quotaBucket(t, q, ""); b.Held != 0 || math.Abs(b.Remaining-(250-cost)) > 1e-6 {
-				t.Fatalf("cancellation leaked hold/lost consumption: %+v want cost=%v", b, cost)
+			if b := quotaBucket(t, q, ""); b.Remaining != 249.75 {
+				t.Fatal("late usage stole other budget", b)
 			}
 		})
 	}

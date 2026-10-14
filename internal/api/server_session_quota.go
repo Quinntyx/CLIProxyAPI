@@ -49,7 +49,7 @@ func (s *Server) sessionQuotaReady(c *gin.Context) *sessionquota.Manager {
 }
 func (s *Server) sessionQuotaStatus(c *gin.Context) {
 	if q := s.sessionQuotaReady(c); q != nil {
-		c.JSON(http.StatusOK, q.Snapshot())
+		c.JSON(http.StatusOK, s.handlers.AuthManager.SessionQuotaSnapshot(c.Query("model")))
 	}
 }
 func (s *Server) sessionQuotaSet(c *gin.Context) {
@@ -68,7 +68,7 @@ func (s *Server) sessionQuotaSet(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, q.Snapshot())
+	c.JSON(http.StatusOK, s.handlers.AuthManager.SessionQuotaSnapshot(c.Query("model")))
 }
 func (s *Server) sessionQuotaClear(c *gin.Context) {
 	q := s.sessionQuotaReady(c)
@@ -79,7 +79,7 @@ func (s *Server) sessionQuotaClear(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, q.Snapshot())
+	c.JSON(http.StatusOK, s.handlers.AuthManager.SessionQuotaSnapshot(c.Query("model")))
 }
 func (s *Server) sessionQuotaClearAll(c *gin.Context) {
 	q := s.sessionQuotaReady(c)
@@ -90,7 +90,7 @@ func (s *Server) sessionQuotaClearAll(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, q.Snapshot())
+	c.JSON(http.StatusOK, s.handlers.AuthManager.SessionQuotaSnapshot(c.Query("model")))
 }
 func (s *Server) sessionQuotaSkim(c *gin.Context) {
 	q := s.sessionQuotaReady(c)
@@ -116,7 +116,7 @@ func (s *Server) sessionQuotaSkim(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"transferred": moved, "quota": q.Snapshot()})
+	c.JSON(http.StatusOK, gin.H{"transferred": moved, "quota": s.handlers.AuthManager.SessionQuotaSnapshot(c.Query("model"))})
 }
 func (s *Server) sessionQuotaFailClosed() gin.HandlerFunc {
 	return func(c *gin.Context) {
