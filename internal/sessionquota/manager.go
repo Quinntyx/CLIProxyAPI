@@ -515,18 +515,26 @@ func (m *Manager) SkimTo(session string, amount float64) (float64, error) {
 		}
 		moved := 0.0
 		for _, b := range m.state.Buckets {
-			if b == destination || b.Cap <= 0 {
+			available := b.Remaining - b.Held
+			// Use the same donors as the weight calculation. Ineligible dust
+			// must not be debited in addition to the requested transfer.
+			if b == destination || b.Cap <= 0 || available <= epsilon {
 				continue
 			}
-			take := math.Min(math.Max(0, b.Remaining-b.Held), left*b.Cap/weight)
+			// Bound each share by this round's remaining budget, including
+			// floating-point overshoot from earlier shares.
+			take := math.Min(available, math.Min(left*b.Cap/weight, math.Max(0, left-moved)))
 			b.Remaining -= take
 			moved += take
 		}
+		if moved <= 0 {
+			break
+		}
+		left = math.Max(0, left-moved)
+		destination.Remaining += moved
 		if moved <= epsilon {
 			break
 		}
-		left -= moved
-		destination.Remaining += moved
 	}
 	return amount - left, m.persistLocked()
 }

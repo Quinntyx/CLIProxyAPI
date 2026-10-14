@@ -439,3 +439,47 @@ func TestNonFiniteAdmissionIsNonRefillable(t *testing.T) {
 	near(t, bucket(t, q, "").Held, 0)
 	invariant(t, q)
 }
+
+func TestSkimNeverTakesDustExcludedFromDonorWeights(t *testing.T) {
+	q := ledger(t, 250)
+	if err := q.Set("dust", 75); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Set("funded", 75); err != nil {
+		t.Fatal(err)
+	}
+	q.mu.Lock()
+	q.state.Buckets["dust"].Held = 75 - epsilon/2
+	q.mu.Unlock()
+	before := bucket(t, q, "dust")
+	moved, err := q.Skim(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved > 10 || moved < 0 {
+		t.Fatalf("skim returned %.17g, outside [0,10]", moved)
+	}
+	after := bucket(t, q, "dust")
+	if after.Remaining != before.Remaining || after.Held != before.Held {
+		t.Fatalf("ineligible donor was debited: before=%+v after=%+v", before, after)
+	}
+	near(t, moved, 10)
+	near(t, bucket(t, q, "").Remaining, 110)
+	invariant(t, q)
+}
+
+func TestSkimFractionalShareIsBoundedByRequestedAmount(t *testing.T) {
+	q := ledger(t, 250)
+	if err := q.Set("donor", 3); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := q.Skim(0.1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved > 0.1 || moved < 0 {
+		t.Fatalf("skim returned %.17g, outside [0,0.1]", moved)
+	}
+	near(t, moved, 0.1)
+	invariant(t, q)
+}
