@@ -42,3 +42,5 @@ respects five-hour capacity and its future refills.
 `debt`, `in_flight`, and `admission_ready`; legacy `held` remains zero. Polling clients should use
 model-scoped `admission_ready`, not an obsolete required-points estimate. A paused Pi run remains
 pending and cancelable until readiness changes; weekly exhaustion is a real terminal outcome.
+
+Reset-deadline jitter, same-window watermark corrections, and inferred cooldowns are not refills: they must not forgive debt or reopen an exhausted session. Debt settlement requires a confirmed new five-hour window (or its predicted deadline), rather than merely a later reset timestamp.

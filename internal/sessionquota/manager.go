@@ -342,10 +342,18 @@ func (m *Manager) Sync(observations []Observation) {
 				a.TokensPerPoint = math.Max(100, math.Min(10000000, 0.8*a.TokensPerPoint+0.2*observedRate))
 			}
 		}
-		// A confirmed rollover can arrive before a predicted reset is observed.
-		// A post-prediction watermark (ResetAt cleared above) only confirms the
-		// new window and must not settle the same penalty twice.
-		if !a.ObservedAt.IsZero() && math.Abs(a.Capacity-cap) <= epsilon && ((!a.ResetAt.IsZero() && o.ResetAt.After(a.ResetAt)) || (a.ResetAt.IsZero() && remaining >= cap-epsilon && a.ObservedRemaining < cap-epsilon)) {
+		// Cooldown predictions and relative-deadline jitter are not refills.
+		// A new five-hour window must have started after the previous sample;
+		// also require replenishment or a full-cycle deadline advance. Otherwise
+		// metadata corrections can silently erase debt and reopen an empty cap.
+		newWindow := !a.ResetAt.IsZero() && o.ResetAt.After(a.ResetAt.Add(time.Minute)) &&
+			o.ResetAt.Add(-5*time.Hour).After(a.ObservedAt) &&
+			(remaining > a.ObservedRemaining+epsilon || o.ResetAt.Sub(a.ResetAt) >= 5*time.Hour-time.Minute)
+		// A cleared reset only settles an unconfirmed full replenishment. After
+		// a predicted rollover, ObservedRemaining is already capacity, so this
+		// cannot settle the same penalty twice.
+		newWatermark := a.ResetAt.IsZero() && remaining >= cap-epsilon && a.ObservedRemaining < cap-epsilon
+		if !o.Estimated && !a.ObservedAt.IsZero() && math.Abs(a.Capacity-cap) <= epsilon && (newWindow || newWatermark) {
 			m.refillWindowLocked(a.ID)
 		}
 		plateau := math.Abs(a.ObservedRemaining-remaining) <= epsilon && math.Abs(a.Capacity-cap) <= epsilon && a.WeeklyExhausted == o.WeeklyExhausted && (a.ResetAt.IsZero() || a.ResetAt.Equal(o.ResetAt))

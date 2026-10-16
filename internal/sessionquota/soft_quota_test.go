@@ -236,3 +236,66 @@ func TestForcedBurnSnapshotExpiryAndWeeklyGate(t *testing.T) {
 		t.Fatal("burn bypassed weekly exhaustion")
 	}
 }
+
+func TestResetMetadataDoesNotForgiveDebtWithoutANewWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		shift     time.Duration
+		remaining float64
+		estimated bool
+		refill    bool
+	}{
+		{name: "one_second_forward", shift: time.Second, remaining: 200},
+		{name: "two_minutes_forward", shift: 2 * time.Minute, remaining: 200},
+		{name: "decreasing_watermark", shift: 2 * time.Minute, remaining: 199},
+		{name: "corrected_watermark_same_window", shift: 2 * time.Minute, remaining: 201},
+		{name: "inferred_cooldown", shift: 5 * time.Hour, remaining: 0, estimated: true},
+		{name: "real_five_hour_rollover", shift: 5 * time.Hour, remaining: 250, refill: true},
+		{name: "confirmed_early_reset", shift: 2 * time.Hour, remaining: 250, refill: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state")
+			q, err := New(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2030, 1, 1, 16, 0, 0, 0, time.UTC)
+			q.now = func() time.Time { return now }
+			oldReset := now.Add(4 * time.Hour)
+			q.Sync([]Observation{{ID: "a", Capacity: 250, Known: true, Remaining: 200, ObservedAt: now, ResetAt: oldReset}})
+			if err := q.Set("work", 10); err != nil {
+				t.Fatal(err)
+			}
+			r, err := q.ReserveRequest("work", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.ConsumeRecord("actual", "a", 110000, false)
+			r.Close(false)
+			near(t, bucket(t, q, "work").Debt, 1)
+			now = now.Add(time.Minute)
+			q.Sync([]Observation{{ID: "a", Capacity: 250, Known: true, Estimated: tc.estimated, Remaining: tc.remaining, ObservedAt: now, ResetAt: oldReset.Add(tc.shift)}})
+			if tc.refill {
+				near(t, bucket(t, q, "work").Debt, 0)
+				if bucket(t, q, "work").Remaining <= 0 {
+					t.Fatal("real refill did not reopen budget")
+				}
+				invariant(t, q)
+				return
+			}
+			for i := 0; i < 2; i++ {
+				near(t, bucket(t, q, "work").Debt, 1)
+				if _, err := q.ReserveRequest("work", false); err == nil {
+					t.Fatal("metadata change reopened exhausted session")
+				}
+				invariant(t, q)
+				restored, err := New(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				q = restored
+				q.now = func() time.Time { return now }
+			}
+		})
+	}
+}
