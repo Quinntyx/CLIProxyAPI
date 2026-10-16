@@ -402,85 +402,75 @@ func (b *BurnController) CapPermits(a *Auth, now time.Time) bool {
 	return b.capPermitsLocked(a, now)
 }
 func (b *BurnController) chooseForcedLocked(auths []*Auth, now time.Time) string {
-	if !b.cfg.Enabled {
-		b.forced = ""
-		return ""
-	}
-	tps, _ := b.rates(now)
-	if tps <= 0 {
-		return b.forcedEligibleLocked(auths, now)
-	}
-	// Keep a chosen burn target through transient rate fluctuations, but never past its deadline/cap.
+	// Preserve routing affinity only while the selected deadline is still urgent.
 	if id := b.forcedEligibleLocked(auths, now); id != "" {
 		return id
 	}
+	tps, _ := b.rates(now)
 	var deadline time.Time
 	for _, a := range auths {
-		if a == nil || a.Provider != "codex" || a.Disabled || a.Status == StatusDisabled || !b.capPermitsLocked(a, now) {
-			continue
-		}
-		state := b.accounts[b.key(a.ID)]
-		if state == nil || !b.burnWeekPermitsLocked(state, now) {
-			continue
-		}
-		effective := b.effectiveLocked(a, now)
-		weight, _ := resetPressureWeight(effective, "codex", now)
-		if weight <= 0 {
-			continue
-		}
-		for kind, w := range state.Windows {
-			if w == nil || w.Closed || w.Observed.IsZero() || w.Observed.After(now.Add(time.Minute)) || !w.Reset.After(now) || now.Sub(w.Observed) > b.maxAge() || w.CalibrationSamples < 2 || w.PercentPerToken <= 0 {
-				continue
-			}
-			ceiling := 100.0
-			key := "five_hour_cap_percent"
-			if kind == "weekly" {
-				key = "weekly_cap_percent"
-			}
-			if n, yes := capValue(a, key); yes {
-				ceiling = n
-			}
-			remainder := ceiling - w.Used
-			projected := b.projectedTokens(state, kind, tps, now) * w.PercentPerToken
-			if remainder <= 0 || projected <= 0 || remainder/projected < b.cfg.Threshold {
-				continue
-			}
-			if deadline.IsZero() || w.Reset.Before(deadline) {
-				b.forced = a.ID
-				b.forcedReset = w.Reset
-				deadline = w.Reset
-			}
+		reset := b.urgentResetLocked(a, tps, now)
+		if !reset.IsZero() && (deadline.IsZero() || reset.Before(deadline)) {
+			b.forced = a.ID
+			b.forcedReset = reset
+			deadline = reset
 		}
 	}
 	return b.forced
 }
+
+// urgentResetLocked is shared by selection and retained-lease validation. A
+// previously forced account is not perpetual authority to bypass session caps.
+func (b *BurnController) urgentResetLocked(a *Auth, tps float64, now time.Time) time.Time {
+	if !b.cfg.Enabled || tps <= 0 || math.IsNaN(tps) || math.IsInf(tps, 0) || a == nil || a.Provider != "codex" || a.Disabled || a.Status == StatusDisabled || !b.capPermitsLocked(a, now) {
+		return time.Time{}
+	}
+	state := b.accounts[b.key(a.ID)]
+	if state == nil || !b.burnWeekPermitsLocked(state, now) {
+		return time.Time{}
+	}
+	effective := b.effectiveLocked(a, now)
+	weight, _ := resetPressureWeight(effective, "codex", now)
+	if weight <= 0 {
+		return time.Time{}
+	}
+	var deadline time.Time
+	for kind, w := range state.Windows {
+		if (kind != "five_hour" && kind != "weekly") || w == nil || w.Closed || w.Observed.IsZero() || w.Observed.After(now.Add(time.Minute)) || !w.Reset.After(now) || now.Sub(w.Observed) > b.maxAge() || w.CalibrationSamples < 2 || w.PercentPerToken <= 0 || math.IsNaN(w.PercentPerToken) || math.IsInf(w.PercentPerToken, 0) {
+			continue
+		}
+		ceiling := 100.0
+		key := "five_hour_cap_percent"
+		if kind == "weekly" {
+			key = "weekly_cap_percent"
+		}
+		if n, yes := capValue(a, key); yes {
+			ceiling = n
+		}
+		remainder := ceiling - w.Used
+		projected := b.projectedTokens(state, kind, tps, now) * w.PercentPerToken
+		if remainder <= 0 || math.IsNaN(remainder) || projected <= 0 || math.IsNaN(projected) || math.IsInf(projected, 0) || remainder/projected < b.cfg.Threshold {
+			continue
+		}
+		if deadline.IsZero() || w.Reset.Before(deadline) {
+			deadline = w.Reset
+		}
+	}
+	return deadline
+}
+
 func (b *BurnController) forcedEligibleLocked(auths []*Auth, now time.Time) string {
 	if b.forced == "" {
 		return ""
 	}
-	if b.forcedReset.After(now) {
-		for _, a := range auths {
-			if a != nil && a.Provider == "codex" && a.ID == b.forced && !a.Disabled && a.Status != StatusDisabled && b.capPermitsLocked(a, now) {
-				state := b.accounts[b.key(a.ID)]
-				if state == nil || !b.burnWeekPermitsLocked(state, now) {
-					continue
-				}
-				windowValid := false
-				for _, w := range state.Windows {
-					if w != nil && w.Reset.Equal(b.forcedReset) && !w.Closed && !w.Observed.IsZero() && !w.Observed.After(now.Add(time.Minute)) && now.Sub(w.Observed) <= b.maxAge() && w.CalibrationSamples >= 2 && w.PercentPerToken > 0 && w.Used < 100 {
-						windowValid = true
-						break
-					}
-				}
-				if !windowValid {
-					continue
-				}
-				effective := b.effectiveLocked(a, now)
-				weight, _ := resetPressureWeight(effective, "codex", now)
-				if weight > 0 {
-					return b.forced
-				}
+	tps, _ := b.rates(now)
+	for _, a := range auths {
+		if a != nil && a.ID == b.forced {
+			reset := b.urgentResetLocked(a, tps, now)
+			if reset.After(now) && reset.Equal(b.forcedReset) {
+				return b.forced
 			}
+			break
 		}
 	}
 	b.forced = ""
@@ -779,12 +769,14 @@ func (b *BurnController) projectedTokens(a *BurnAccount, kind string, tps float6
 	if target == nil || !target.Reset.After(now) || tps <= 0 {
 		return 0
 	}
-	otherKind := "weekly"
-	cycle := 7 * 24 * time.Hour
-	if kind == "weekly" {
-		otherKind = "five_hour"
-		cycle = 5 * time.Hour
+	// Weekly scarcity is not evidence that a five-hour deadline is near.
+	// Clamping this forecast by the weekly remainder turns an unspendable
+	// allowance into permanently high urgency, regardless of available time.
+	if kind == "five_hour" {
+		return tps * target.Reset.Sub(now).Seconds()
 	}
+	otherKind := "five_hour"
+	cycle := 5 * time.Hour
 	other := a.Windows[otherKind]
 	if other == nil || !other.Reset.After(now) || other.CalibrationSamples < 2 || other.PercentPerToken <= 0 || now.Sub(other.Observed) > b.maxAge() {
 		return tps * target.Reset.Sub(now).Seconds()

@@ -30,6 +30,11 @@ usage is still accounted to their session. The request is pinned to the eligible
 expired, disabled, weekly-exhausted, wrong-model, or conflicting pinned routes cannot bypass admission
 or fall back to an unrelated account under the same override. Normal preference rules apply otherwise.
 
+Burn pressure is revalidated for routing, status readiness, and retained request leases. A selected
+account cannot keep bypassing session caps after its pressure disappears. Five-hour urgency uses
+throughput and time to its own reset, not a weekly-budget-clamped forecast; weekly urgency still
+respects five-hour capacity and its future refills.
+
 ## Public status
 
 `GET /v1/session-quota?model=<active-model>` reports `admission_mode: "soft"`,
