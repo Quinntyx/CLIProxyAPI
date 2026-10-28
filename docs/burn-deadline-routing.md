@@ -22,7 +22,7 @@ For both five-hour and weekly windows, an account becomes urgent when `remaining
 
 ## Request failures
 
-Burn prioritization, session affinity and shared-account caps apply to credential routing, not per-session budgets. CLIProxyAPI does not reserve quota for tmux windows or maintain session quota buckets. Quota failures follow the normal configured retry/cooldown policy and return to the client; waiting for quota resumption is the client's responsibility. The former `/v1/session-quota` endpoints and local quota-pause protocol are removed, and legacy session-quota state files are ignored.
+Burn prioritization, session affinity and shared-account caps apply to credential routing, not per-session budgets. CLIProxyAPI does not reserve quota for tmux windows or maintain session quota buckets. Quota failures follow the normal configured retry/cooldown policy and return to the client; waiting for quota resumption is the client's responsibility.
 
 ## Weekly accounting
 

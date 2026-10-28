@@ -63,3 +63,21 @@ func TestBurnForcedTargetRevalidatesCurrentPressure(t *testing.T) {
 		})
 	}
 }
+
+func TestBurnExhaustedTargetIsNeverForced(t *testing.T) {
+	// An account whose five-hour window is fully consumed must not be chosen as
+	// the forced burn target: reset-pressure would refuse it and routing would
+	// starve while other accounts still have headroom.
+	now := time.Now().Truncate(time.Second)
+	b := burnTestController(now)
+	exhausted := &Auth{ID: "exhausted", Provider: "codex"}
+	exhausted.Quota = burnTestQuota(now, 100, 10, now.Add(3*time.Hour), now.Add(24*time.Hour))
+	b.Observe(exhausted, exhausted.Quota, now)
+	healthy := &Auth{ID: "healthy", Provider: "codex"}
+	healthy.Quota = burnTestQuota(now, 20, 10, now.Add(3*time.Hour), now.Add(24*time.Hour))
+	b.Observe(healthy, healthy.Quota, now)
+	b.lastTokenTPS = 100
+	if got := b.chooseForcedLocked([]*Auth{exhausted, healthy}, now); got == exhausted.ID {
+		t.Fatal("exhausted account was selected as the forced burn target")
+	}
+}

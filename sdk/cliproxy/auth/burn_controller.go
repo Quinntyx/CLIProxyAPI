@@ -459,6 +459,12 @@ func (b *BurnController) urgentResetLocked(a *Auth, tps float64, now time.Time) 
 	return deadline
 }
 
+// A forced five-hour burn never grants an escape from an exhausted weekly pool.
+func (b *BurnController) burnWeekPermitsLocked(state *BurnAccount, now time.Time) bool {
+	w := state.Windows["weekly"]
+	return w != nil && !w.Closed && !w.Observed.IsZero() && !w.Observed.After(now.Add(time.Minute)) && now.Sub(w.Observed) <= b.maxAge() && w.Reset.After(now) && w.Used < 100
+}
+
 func (b *BurnController) forcedEligibleLocked(auths []*Auth, now time.Time) string {
 	if b.forced == "" {
 		return ""
@@ -798,10 +804,4 @@ func (b *BurnController) projectedTokens(a *BurnAccount, kind string, tps float6
 		available = cap / other.PercentPerToken
 	}
 	return total
-}
-
-// A forced five-hour burn never grants an escape from an exhausted weekly pool.
-func (b *BurnController) burnWeekPermitsLocked(state *BurnAccount, now time.Time) bool {
-	w := state.Windows["weekly"]
-	return w != nil && !w.Closed && !w.Observed.IsZero() && !w.Observed.After(now.Add(time.Minute)) && now.Sub(w.Observed) <= b.maxAge() && w.Reset.After(now) && w.Used < 100
 }
