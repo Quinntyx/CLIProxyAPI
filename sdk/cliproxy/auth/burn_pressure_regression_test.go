@@ -81,3 +81,28 @@ func TestBurnExhaustedTargetIsNeverForced(t *testing.T) {
 		t.Fatal("exhausted account was selected as the forced burn target")
 	}
 }
+
+func TestBurnStaleLatchDoesNotSurviveLostUrgency(t *testing.T) {
+	// A latched forced target that later exhausts its window must be revoked:
+	// chooseForcedLocked previously fell through to the stale latch even after
+	// forcedEligibleLocked revalidation failed, starving routing onto the one
+	// account reset-pressure refuses.
+	now := time.Now().Truncate(time.Second)
+	b := burnTestController(now)
+	target := &Auth{ID: "latch-target", Provider: "codex"}
+	target.Quota = burnTestQuota(now, 10, 10, now.Add(10*time.Minute), now.Add(24*time.Hour))
+	b.Observe(target, target.Quota, now)
+	w := b.account(target.ID).Windows["five_hour"]
+	w.PercentPerToken, w.CalibrationSamples = .1, 2
+	b.lastTokenTPS = 1
+	if got := b.chooseForcedLocked([]*Auth{target}, now); got != target.ID {
+		t.Fatalf("genuine pressure did not latch the target: %q", got)
+	}
+	// The window exhausts before its reset; the latch must not survive.
+	later := now.Add(time.Minute)
+	target.Quota = burnTestQuota(later, 100, 10, later.Add(9*time.Minute), later.Add(24*time.Hour))
+	b.Observe(target, target.Quota, later)
+	if got := b.chooseForcedLocked([]*Auth{target}, later); got != "" {
+		t.Fatalf("stale latch survived lost urgency: %q", got)
+	}
+}

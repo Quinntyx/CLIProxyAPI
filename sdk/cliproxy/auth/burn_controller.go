@@ -408,15 +408,20 @@ func (b *BurnController) chooseForcedLocked(auths []*Auth, now time.Time) string
 	}
 	tps, _ := b.rates(now)
 	var deadline time.Time
+	forced := ""
 	for _, a := range auths {
 		reset := b.urgentResetLocked(a, tps, now)
 		if !reset.IsZero() && (deadline.IsZero() || reset.Before(deadline)) {
-			b.forced = a.ID
+			forced = a.ID
 			b.forcedReset = reset
 			deadline = reset
 		}
 	}
-	return b.forced
+	// Revoke the latch when no candidate is urgent: a previously forced account
+	// that stopped being urgent (e.g. its window was exhausted) must not keep
+	// narrowing selection onto a target reset-pressure will refuse.
+	b.forced = forced
+	return forced
 }
 
 // urgentResetLocked is shared by selection and retained-lease validation. A
