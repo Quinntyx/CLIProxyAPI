@@ -524,6 +524,20 @@ func (s *BurnDeadlineSelector) Pick(ctx context.Context, provider, model string,
 	if fallback == nil {
 		fallback = &ResetPressureSelector{}
 	}
+	// Drop accounts reset-pressure would refuse (window fully consumed) before
+	// narrowing: an exhausted account must not survive idle-preference filtering
+	// as the sole candidate and starve routing while demoted accounts have
+	// headroom. When every candidate is refused, keep the original set so the
+	// fallback reports the real cooldown deadline.
+	routable := make([]*Auth, 0, len(available))
+	for _, a := range available {
+		if weight, _ := resetPressureWeight(a, provider, now); weight > 0 {
+			routable = append(routable, a)
+		}
+	}
+	if len(routable) > 0 {
+		available = routable
+	}
 	forcedAvailable := false
 	if id != "" {
 		for _, a := range available {
@@ -535,16 +549,7 @@ func (s *BurnDeadlineSelector) Pick(ctx context.Context, provider, model string,
 		}
 	}
 	if !forcedAvailable {
-		preferred := preferIdleCodexAccounts(available)
-		chosen, errPick := fallback.Pick(ctx, provider, model, opts, preferred)
-		if errPick == nil || len(preferred) == len(available) {
-			return chosen, errPick
-		}
-		// The idle-preferred subset was refused (for example its only member is
-		// quota-exhausted and reset-pressure rejects it). Preserving the uncapped
-		// subscription must not starve routing while other candidates have
-		// headroom, so retry with the full set.
-		return fallback.Pick(ctx, provider, model, opts, available)
+		available = preferIdleCodexAccounts(available)
 	}
 	return fallback.Pick(ctx, provider, model, opts, available)
 }

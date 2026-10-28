@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -148,9 +149,10 @@ func TestRemainingQuotaDescribesOnlyActualBindingWithoutSecrets(t *testing.T) {
 }
 
 func TestIdlePreferenceDoesNotStarveWhenPreferredTierIsRefused(t *testing.T) {
-	// The uncapped team subscription is demoted for preservation, but when the
-	// preferred tier's only member is quota-exhausted and reset-pressure refuses
-	// it, selection must fall back to the demoted candidate instead of failing.
+	// The uncapped team subscription is demoted for preservation, but accounts
+	// reset-pressure would refuse (window fully consumed) are filtered out
+	// before the idle-preference narrowing, so a quota-exhausted plus account
+	// cannot become the sole candidate and starve routing.
 	now := time.Now().Truncate(time.Second)
 	b := burnTestController(now)
 	exhausted := &Auth{ID: "exhausted-plus", Provider: "codex", Metadata: map[string]any{"plan_type": "plus"}}
@@ -164,5 +166,12 @@ func TestIdlePreferenceDoesNotStarveWhenPreferredTierIsRefused(t *testing.T) {
 	chosen, err := selector.Pick(context.Background(), "codex", "", exec.Options{}, []*Auth{exhausted, uncapped})
 	if err != nil || chosen == nil || chosen.ID != uncapped.ID {
 		t.Fatalf("starved routing: chosen=%+v err=%v", chosen, err)
+	}
+	// When every candidate is refused, the fallback still reports the real
+	// cooldown instead of a synthetic unavailable error.
+	chosen, err = selector.Pick(context.Background(), "codex", "", exec.Options{}, []*Auth{exhausted})
+	var cooldown *modelCooldownError
+	if err == nil || !errors.As(err, &cooldown) {
+		t.Fatalf("all-refused selection = %+v, %v; want model cooldown", chosen, err)
 	}
 }
