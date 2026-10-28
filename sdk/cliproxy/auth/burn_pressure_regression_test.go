@@ -1,14 +1,9 @@
 package auth
 
 import (
-	"context"
-	"errors"
 	"math"
 	"testing"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/sessionquota"
-	exec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestBurnFiveHourProjectionDoesNotTurnWeeklyScarcityIntoUrgency(t *testing.T) {
@@ -66,34 +61,5 @@ func TestBurnForcedTargetRevalidatesCurrentPressure(t *testing.T) {
 				t.Fatalf("reselected nonurgent target after %s: %q", change, got)
 			}
 		})
-	}
-}
-
-func TestForcedBurnLosingUrgencyRevokesLeaseReadinessAndAdmission(t *testing.T) {
-	m, _, b, model, id, _ := forcedQuotaFixture(t)
-	lease := m.routableForcedBurn(context.Background(), model, exec.Options{})
-	if lease == nil {
-		t.Fatal("genuine pressure did not issue lease")
-	}
-	b.mu.Lock()
-	b.lastTokenTPS = 100000
-	b.mu.Unlock()
-	a, _ := m.GetByID(id)
-	if lease.permits(a) {
-		t.Fatal("retained lease bypassed cap after pressure disappeared")
-	}
-	snap := m.SessionQuotaSnapshot(model)
-	if snap.ForcedBurn.Eligible {
-		t.Fatal("public readiness still advertises stale burn")
-	}
-	for _, bucket := range snap.Buckets {
-		if bucket.Session == "waiting" && bucket.AdmissionReady {
-			t.Fatal("empty session advertised as ready")
-		}
-	}
-	_, _, reservation, err := m.admitSessionQuota(context.Background(), []string{"codex"}, exec.Request{Model: model}, exec.Options{Metadata: map[string]any{sessionquota.MetadataKey: "waiting"}})
-	var exhausted *sessionquota.ExhaustedError
-	if reservation != nil || !errors.As(err, &exhausted) {
-		t.Fatalf("empty session admitted after urgency disappeared: %v", err)
 	}
 }

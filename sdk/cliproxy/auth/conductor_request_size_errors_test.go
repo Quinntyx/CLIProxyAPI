@@ -165,7 +165,7 @@ func TestRequestBufferErrorContractAndClassificationBoundaries(t *testing.T) {
 			cause := customStatusError{code: status, msg: "exceeded request buffer limit while retrying upstream"}
 			err := normalizeRequestSizeError(fmt.Errorf("wrapped: %w", cause))
 			var sizeErr *requestSizeError
-			if !errors.As(err, &sizeErr) || !errors.Is(err, cause) || !isRequestInvalidError(err) || !noQuotaCharge(err) {
+			if !errors.As(err, &sizeErr) || !errors.Is(err, cause) || !isRequestInvalidError(err) {
 				t.Fatalf("lost request fault/cause: %T/%v", err, err)
 			}
 			var body struct {
@@ -199,7 +199,14 @@ func TestRequestBufferErrorContractAndClassificationBoundaries(t *testing.T) {
 }
 
 func TestLateStreamingRequestBufferErrorDoesNotPoisonCredentials(t *testing.T) {
-	m, q, model := quotaManager(t)
+	m := NewManager(nil, nil, nil)
+	model := "late-request-buffer-model"
+	id := "late-request-buffer-auth"
+	registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatal(err)
+	}
 	m.SetRetryConfig(3, 0, 0)
 	calls := 0
 	m.RegisterExecutor(&customStreamMockExecutor{identifier: "codex", streamFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
@@ -224,13 +231,9 @@ func TestLateStreamingRequestBufferErrorDoesNotPoisonCredentials(t *testing.T) {
 	if !errors.As(terminal, &sizeErr) || calls != 1 {
 		t.Fatalf("terminal error/calls = %T/%v/%d", terminal, terminal, calls)
 	}
-	a, _ := m.GetByID("quota-auth-" + t.Name())
+	a, _ := m.GetByID(id)
 	if a.Unavailable || !a.NextRetryAfter.IsZero() || a.Quota.Exceeded {
 		t.Fatalf("credential poisoned: %+v", a)
-	}
-	b := quotaBucket(t, q, "")
-	if b.Held != 0 || b.Remaining != 250 {
-		t.Fatalf("late terminal fault leaked/charged reservation: %+v", b)
 	}
 	// A subsequent reduced request must remain routable with the same credential.
 	m.RegisterExecutor(&mockCustomErrorExecutor{identifier: "codex", executeFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

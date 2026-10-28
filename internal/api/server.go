@@ -84,9 +84,6 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
-	// sessionQuotaError prevents inference from bypassing unreadable persisted budgets.
-	sessionQuotaError error
-
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
 
@@ -196,7 +193,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
-	s.setupSessionQuota()
 	s.handlers.SetPluginHost(optionState.pluginHost)
 	if optionState.pluginHost != nil {
 		optionState.pluginHost.SetModelExecutor(s.handlers)

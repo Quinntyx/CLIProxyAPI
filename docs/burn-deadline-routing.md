@@ -20,6 +20,10 @@ The controller observes usage records and passively reported quota, and polls th
 
 For both five-hour and weekly windows, an account becomes urgent when `remaining usable quota / projected continuous burn >= threshold`. Weekly projection is bounded by the other five-hour window's capacity/reset. The earliest urgent deadline wins, and the choice is latched until its deadline, cap or availability changes. Predictions are estimates, not fixed Codex token allowances or guarantees of future throughput.
 
+## Request failures
+
+Burn prioritization, session affinity and shared-account caps apply to credential routing, not per-session budgets. CLIProxyAPI does not reserve quota for tmux windows or maintain session quota buckets. Quota failures follow the normal configured retry/cooldown policy and return to the client; waiting for quota resumption is the client's responsibility. The former `/v1/session-quota` endpoints and local quota-pause protocol are removed, and legacy session-quota state files are ignored.
+
 ## Weekly accounting
 
 Each completed subscription-week contributes `100 - observed weekly used percent` waste. Inefficiency averages active weeks with nonzero locally recorded token usage; total waste averages all observed completed weeks, including idle weeks. Five-hour resets never enter these tallies. Initial/missing history cannot be reconstructed from tokens; stale closures are marked estimated. Quota consumed by other clients changes the observed remainder. Missing provider observations aren't invented as exact idle periods.

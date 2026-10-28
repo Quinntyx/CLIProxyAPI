@@ -10,7 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/sessionquota"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"golang.org/x/net/context"
 )
@@ -129,23 +128,6 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			c.Writer.Header().Add("Retry-After", value)
 		}
 	}
-	// Local quota metadata is part of the admission protocol, not upstream
-	// header passthrough. Only concrete local errors may supply these headers.
-	var quotaBody string
-	if msg != nil && msg.Error != nil {
-		var exhausted *sessionquota.ExhaustedError
-		var quotaHeaders http.Header
-		switch {
-		case errors.As(msg.Error, &exhausted):
-			quotaHeaders, quotaBody = exhausted.Headers(), exhausted.Error()
-		}
-		for key, values := range quotaHeaders {
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
-	}
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 || IsCPAReservedResponseHeader(key) {
@@ -163,10 +145,6 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
 			errText = v
 		}
-	}
-
-	if quotaBody != "" {
-		errText = quotaBody
 	}
 
 	var errCause error
