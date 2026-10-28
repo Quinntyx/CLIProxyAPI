@@ -146,3 +146,23 @@ func TestRemainingQuotaDescribesOnlyActualBindingWithoutSecrets(t *testing.T) {
 		t.Fatal("duplicate credential hid effective seat cap", result.CurrentAccount)
 	}
 }
+
+func TestIdlePreferenceDoesNotStarveWhenPreferredTierIsRefused(t *testing.T) {
+	// The uncapped team subscription is demoted for preservation, but when the
+	// preferred tier's only member is quota-exhausted and reset-pressure refuses
+	// it, selection must fall back to the demoted candidate instead of failing.
+	now := time.Now().Truncate(time.Second)
+	b := burnTestController(now)
+	exhausted := &Auth{ID: "exhausted-plus", Provider: "codex", Metadata: map[string]any{"plan_type": "plus"}}
+	exhausted.Quota = burnTestQuota(now, 100, 10, now.Add(3*time.Hour), now.Add(24*time.Hour))
+	b.Observe(exhausted, exhausted.Quota, now)
+	uncapped := &Auth{ID: "uncapped-team", Provider: "codex", Metadata: map[string]any{"plan_type": "team"}}
+	uncapped.Quota = burnTestQuota(now, 20, 10, now.Add(3*time.Hour), now.Add(24*time.Hour))
+	b.Observe(uncapped, uncapped.Quota, now)
+	b.lastTokenTPS = 10
+	selector := &BurnDeadlineSelector{Controller: b, Fallback: &ResetPressureSelector{}}
+	chosen, err := selector.Pick(context.Background(), "codex", "", exec.Options{}, []*Auth{exhausted, uncapped})
+	if err != nil || chosen == nil || chosen.ID != uncapped.ID {
+		t.Fatalf("starved routing: chosen=%+v err=%v", chosen, err)
+	}
+}

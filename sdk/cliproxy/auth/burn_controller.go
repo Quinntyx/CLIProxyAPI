@@ -520,6 +520,10 @@ func (s *BurnDeadlineSelector) Pick(ctx context.Context, provider, model string,
 	if err != nil {
 		return nil, err
 	}
+	fallback := s.Fallback
+	if fallback == nil {
+		fallback = &ResetPressureSelector{}
+	}
 	forcedAvailable := false
 	if id != "" {
 		for _, a := range available {
@@ -531,11 +535,16 @@ func (s *BurnDeadlineSelector) Pick(ctx context.Context, provider, model string,
 		}
 	}
 	if !forcedAvailable {
-		available = preferIdleCodexAccounts(available)
-	}
-	fallback := s.Fallback
-	if fallback == nil {
-		fallback = &ResetPressureSelector{}
+		preferred := preferIdleCodexAccounts(available)
+		chosen, errPick := fallback.Pick(ctx, provider, model, opts, preferred)
+		if errPick == nil || len(preferred) == len(available) {
+			return chosen, errPick
+		}
+		// The idle-preferred subset was refused (for example its only member is
+		// quota-exhausted and reset-pressure rejects it). Preserving the uncapped
+		// subscription must not starve routing while other candidates have
+		// headroom, so retry with the full set.
+		return fallback.Pick(ctx, provider, model, opts, available)
 	}
 	return fallback.Pick(ctx, provider, model, opts, available)
 }
