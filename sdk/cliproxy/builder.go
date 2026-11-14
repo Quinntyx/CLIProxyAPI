@@ -269,6 +269,7 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
+	syncModelRoutes(b.cfg.ModelRoutes)
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)
 	}

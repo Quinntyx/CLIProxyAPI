@@ -104,20 +104,61 @@ func resetPressureWeight(auth *Auth, provider string, now time.Time) (float64, t
 	if auth == nil {
 		return 0, time.Time{}
 	}
+	windows, ok := observedQuotaWindows(auth, provider, now)
+	if !ok {
+		return 1, time.Time{}
+	}
+	pressure := 0.0
+	var blockedUntil time.Time
+	for _, window := range windows {
+		if window.used == 1 {
+			if window.reset.After(blockedUntil) {
+				blockedUntil = window.reset
+			}
+			continue
+		}
+		// Normalize by window length so weekly pressure is not dwarfed by 5h.
+		// A one-minute floor and bounded boost avoid singularities near reset.
+		remaining := math.Max(window.reset.Sub(now).Seconds(), 60)
+		windowPressure := (1 - window.used) * window.period.Seconds() / remaining
+		pressure = math.Max(pressure, windowPressure)
+	}
+	if !blockedUntil.IsZero() {
+		return 0, blockedUntil
+	}
+	return 1 + math.Min(pressure, resetPressureMaxBoost), time.Time{}
+}
+
+// quotaWindowObservation is one valid five-hour or weekly observation.
+type quotaWindowObservation struct {
+	period time.Duration
+	used   float64 // Consumed fraction in [0, 1].
+	reset  time.Time
+}
+
+// observedQuotaWindows parses the passive Codex/Claude quota snapshot. ok is
+// false when the provider is unsupported or no usable snapshot exists. Invalid,
+// expired or implausible windows are omitted rather than guessed.
+func observedQuotaWindows(auth *Auth, provider string, now time.Time) ([]quotaWindowObservation, bool) {
+	if auth == nil {
+		return nil, false
+	}
 	if auth.Provider != "" {
 		provider = auth.Provider
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != "codex" && provider != "claude" {
+		return nil, false
+	}
 	q := auth.Quota
 	if len(q.Signals) == 0 || q.ObservedAt.After(now.Add(time.Minute)) {
-		return 1, time.Time{}
+		return nil, false
 	}
 	headers := make(map[string]string, len(q.Signals))
 	for name, value := range q.Signals {
 		headers[strings.ToLower(name)] = strings.TrimSpace(value)
 	}
-	pressure := 0.0
-	var blockedUntil time.Time
+	var windows []quotaWindowObservation
 	for index, period := range []time.Duration{5 * time.Hour, 7 * 24 * time.Hour} {
 		var prefix, usedKey string
 		scale := 100.0
@@ -142,8 +183,6 @@ func resetPressureWeight(auth *Auth, provider string, now time.Time) (float64, t
 			}
 			usedKey = prefix + "utilization"
 			scale = 1
-		default:
-			return 1, time.Time{}
 		}
 		used, err := strconv.ParseFloat(headers[usedKey], 64)
 		if err != nil || math.IsNaN(used) || math.IsInf(used, 0) || used < 0 || used > scale {
@@ -153,22 +192,43 @@ func resetPressureWeight(auth *Auth, provider string, now time.Time) (float64, t
 		if !ok || reset.Sub(now) > period+time.Minute {
 			continue
 		}
-		if used == scale {
-			if reset.After(blockedUntil) {
-				blockedUntil = reset
-			}
-			continue
-		}
-		// Normalize by window length so weekly pressure is not dwarfed by 5h.
-		// A one-minute floor and bounded boost avoid singularities near reset.
-		remaining := math.Max(reset.Sub(now).Seconds(), 60)
-		windowPressure := (1 - used/scale) * period.Seconds() / remaining
-		pressure = math.Max(pressure, windowPressure)
+		windows = append(windows, quotaWindowObservation{period: period, used: used / scale, reset: reset})
 	}
-	if !blockedUntil.IsZero() {
-		return 0, blockedUntil
+	return windows, true
+}
+
+// ObservedQuotaWindow is a read-only view of a passively observed subscription window.
+type ObservedQuotaWindow struct {
+	// Period is the window length (five hours or seven days).
+	Period time.Duration
+	// UsedPercent is the consumed share in percentage points.
+	UsedPercent float64
+	// ResetsAt is when the window resets.
+	ResetsAt time.Time
+}
+
+// ObservedQuotaWindows reports the valid passive quota windows of a Codex or
+// Claude credential. supported is false for providers without observations.
+// It never issues requests or mutates scheduling state.
+func ObservedQuotaWindows(auth *Auth, now time.Time) (windows []ObservedQuotaWindow, supported bool) {
+	if auth == nil || !ProviderSupportsQuotaWindows(auth.Provider) {
+		return nil, false
 	}
-	return 1 + math.Min(pressure, resetPressureMaxBoost), time.Time{}
+	observed, _ := observedQuotaWindows(auth, auth.Provider, now)
+	for _, window := range observed {
+		windows = append(windows, ObservedQuotaWindow{Period: window.period, UsedPercent: window.used * 100, ResetsAt: window.reset})
+	}
+	return windows, true
+}
+
+// ProviderSupportsQuotaWindows reports whether ObservedQuotaWindows can read the provider.
+func ProviderSupportsQuotaWindows(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "claude":
+		return true
+	default:
+		return false
+	}
 }
 
 func resetPressureReset(headers map[string]string, prefix string, observedAt, now time.Time) (time.Time, bool) {

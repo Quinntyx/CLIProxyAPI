@@ -849,6 +849,59 @@ upstream:
 #           alias: "claude-opus-4.66"
 #         - name: "kimi-k2.5"
 #           alias: "claude-opus-4.66"
+#         - name: "deepseek/deepseek-v4.1-flash-1017" # listed so model-routes can target it
+#
+#     # Subscription providers with normalized usage at GET /v8/management/providers/<name>/usage.
+#     # Usage adapters are selected by base-url host (or these provider names) and only call
+#     # the provider's own base URL with its own key. Other compatible providers (for example
+#     # Inco, Bitdeer or Featherless) route normally and report usage as unsupported.
+#     - name: "mistral" # usage: separate Vibe and API budgets from /billing/budget
+#       base-url: "https://api.mistral.ai/v1"
+#       keys:
+#         - api-key: "replace-with-mistral-key"
+#       models:
+#         - name: "deepseek-v4-1-flash-1017"
+#     - name: "opencode-go" # usage: rolling, weekly and monthly windows from /usage
+#       base-url: "https://opencode.ai/zen/go/v1"
+#       keys:
+#         - api-key: "replace-with-opencode-go-key"
+#       models:
+#         - name: "deepseek-v4.1-flash"
+#     - name: "inco"
+#       base-url: "https://api.inco.ai/v1"
+#       keys:
+#         - api-key: "replace-with-inco-key"
+#       models:
+#         - name: "deepseek-v4.1-flash:fast"
+#
+# # Exposed model aliases backed by ordered provider/model targets. Targets are tried in
+# # order until one starts responding: credential, quota, availability and upstream errors
+# # move to the next target, while caller request errors and cancellation do not. Once a
+# # streamed response has produced output it is never switched. Targets may be unrelated
+# # model families. Clients keep seeing the alias in responses and model lists; an alias
+# # is listed while at least one target is available. "provider" is an
+# # openai-compatibility name or a built-in provider key (for example claude or codex);
+# # "model" is a model id that provider serves. "params" sets payload JSON paths for that
+# # target on OpenAI-compatible providers; requests.payload rules still apply afterwards.
+# # A colon is an ordinary alias character: "name:fast" is just another route.
+# model-routes:
+#   - alias: "deepseek-v4.1-flash-1017"
+#     targets:
+#       - provider: "mistral"
+#         model: "deepseek-v4-1-flash-1017"
+#       - provider: "opencode-go"
+#         model: "deepseek-v4.1-flash"
+#       - provider: "openrouter"
+#         model: "deepseek/deepseek-v4.1-flash-1017"
+#         params: # pin OpenRouter hosts: Wafer first, restricted Relace fallback only
+#           provider:
+#             only: ["wafer", "relace"]
+#             order: ["wafer", "relace"]
+#             allow_fallbacks: false
+#   - alias: "deepseek-v4.1-flash-1017:fast"
+#     targets:
+#       - provider: "inco"
+#         model: "deepseek-v4.1-flash:fast"
 
 # END API KEY EXAMPLES
 

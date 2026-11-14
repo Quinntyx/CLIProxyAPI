@@ -46,7 +46,19 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
-	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
+	var routeDecision modelRouteDecision
+	if execOptions.modelRoute != nil {
+		originalRequestedModel = execOptions.modelRoute.Alias
+	} else {
+		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
+		if routeDecision == (modelRouteDecision{}) {
+			if targets, ok := h.resolveModelRoute(modelName, execOptions); ok {
+				return h.executeModelRoute(ctx, targets, func(target modelRouteTarget) ([]byte, http.Header, *interfaces.ErrorMessage) {
+					return h.executeWithAuthManagerFormats(ctx, entryProtocol, exitProtocol, target.Model, rawJSON, alt, allowImageModel, target.options(execOptions))
+				})
+			}
+		}
+	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
 		return nil, nil, errMsg
@@ -66,6 +78,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
+	applyModelRouteMetadata(reqMeta, execOptions.modelRoute)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
@@ -125,7 +138,19 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 
 func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
-	routeDecision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
+	var routeDecision modelRouteDecision
+	if execOptions.modelRoute != nil {
+		originalRequestedModel = execOptions.modelRoute.Alias
+	} else {
+		routeDecision = h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
+		if routeDecision == (modelRouteDecision{}) {
+			if targets, ok := h.resolveModelRoute(modelName, execOptions); ok {
+				return h.executeModelRoute(ctx, targets, func(target modelRouteTarget) ([]byte, http.Header, *interfaces.ErrorMessage) {
+					return h.executeCountWithAuthManager(ctx, handlerType, target.Model, rawJSON, alt, target.options(execOptions))
+				})
+			}
+		}
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
@@ -137,6 +162,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+	applyModelRouteMetadata(reqMeta, execOptions.modelRoute)
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)

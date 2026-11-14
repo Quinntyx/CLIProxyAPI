@@ -242,6 +242,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)
+	syncModelRoutes(commit.cfg.ModelRoutes)
 	return true
 }
 
