@@ -26,6 +26,8 @@ type modelExecutionOptions struct {
 	AuthSelectionModel      string
 	ProxyURL                string
 	Path                    string
+	// modelRoute is set while executing one target of a configured model route.
+	modelRoute *modelRouteTarget
 }
 
 // ProtocolExecutionRequest describes a route-level model execution request with explicit protocols.

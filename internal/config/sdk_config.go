@@ -72,6 +72,9 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// ModelRoutes maps exposed model aliases to ordered provider/model targets.
+	ModelRoutes []ModelRoute `yaml:"model-routes,omitempty" json:"model-routes,omitempty"`
 }
 
 // ClientConfig configures client-facing compatibility behavior.

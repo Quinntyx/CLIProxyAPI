@@ -1,6 +1,9 @@
 package cliproxy
 
-import "github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+import (
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+)
 
 // ModelInfo re-exports the registry model info structure.
 type ModelInfo = registry.ModelInfo
@@ -35,4 +38,17 @@ func GlobalModelRegistry() ModelRegistry {
 // SetGlobalModelRegistryHook registers an optional hook on the shared global registry instance.
 func SetGlobalModelRegistryHook(hook ModelRegistryHook) {
 	registry.GetGlobalRegistry().SetHook(hook)
+}
+
+// syncModelRoutes projects configured route aliases into the shared catalog.
+func syncModelRoutes(routes []config.ModelRoute) {
+	projected := make([]registry.ModelRoute, 0, len(routes))
+	for _, route := range routes {
+		targets := make([]registry.ModelRouteTarget, 0, len(route.Targets))
+		for _, target := range route.Targets {
+			targets = append(targets, registry.ModelRouteTarget{Provider: target.Provider, Model: target.Model})
+		}
+		projected = append(projected, registry.ModelRoute{Alias: route.Alias, Targets: targets})
+	}
+	registry.GetGlobalRegistry().SetModelRoutes(projected)
 }

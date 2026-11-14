@@ -11,6 +11,11 @@ import (
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// ModelRouteParamsMetadataKey stores the map of payload JSON paths configured on
+// the model-route target selected for this execution. Executors apply them before
+// user payload rules so the payload configuration remains the final barrier.
+const ModelRouteParamsMetadataKey = "model_route_params"
+
 // RequestPathMetadataKey stores the inbound HTTP request path (e.g. "/v1/images/generations") in Options.Metadata.
 // It is optional and may be absent for non-HTTP executions.
 const RequestPathMetadataKey = "request_path"

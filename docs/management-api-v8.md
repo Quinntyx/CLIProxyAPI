@@ -88,6 +88,9 @@ retain the corresponding business operation's fields.
 | Path | Methods | Description |
 | --- | --- | --- |
 | `/config/upstream/<provider>` | GET, PUT, PATCH, DELETE | Manage shared provider settings. |
+| `/providers` | GET | List configured upstream providers. |
+| `/providers/<id>/usage` | GET | Get normalized subscription usage for one provider. |
+| `/models` | GET | List the exposed model catalog, including model routes. |
 | `/server/latest-version` | GET | Get latest release information. |
 | `/requests/api-call` | POST | Make an authenticated upstream call. |
 | `/routing/cooldown/reset` | POST | Clear credential cooldown. |
@@ -114,6 +117,64 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+## Providers, usage, and models
+
+`GET /v8/management/providers` lists configured OpenAI-compatible providers and
+every built-in or plugin provider with registered credentials. Credentials are
+never returned.
+
+```json
+{"providers":[{"id":"mistral","name":"mistral","disabled":false,"model_ids":["deepseek-v4.1-flash-1017"],"usage_supported":true}]}
+```
+
+`id` is the stable provider id: the lower-cased `openai-compatibility` name or the
+built-in provider key (for example `codex`). It is also the `provider` value of a
+model-route target. `model_ids` are exposed proxy model ids served by the provider,
+including model-route aliases with a target on it. `usage_supported` means a usage
+adapter exists, not that the credential is valid.
+
+`GET /v8/management/providers/<id>/usage` reports each credential separately.
+Unknown providers return 404.
+
+```json
+{"provider_id":"mistral","accounts":[{"id":"1a2b3c4d5e6f7a8b","status":"ok","plan":"Pro","checked_at":"2026-11-14T03:00:00Z","windows":[{"id":"api","label":"API","used_percent":25,"used":3.75,"limit":15,"remaining":11.25,"unit":"usd","resets_at":"2026-12-01T00:00:00Z"}]}]}
+```
+
+Account `status` is `ok`, `unsupported`, `unavailable`, or `error`; failed or
+unsupported accounts have empty `windows` and a short `error`. One account's
+failure does not affect the others. Window values the vendor does not report are
+omitted rather than shown as zero or unlimited. Currency amounts are money in
+`unit`, not tokens.
+
+| Provider | Source | Windows |
+| --- | --- | --- |
+| Mistral (`api.mistral.ai`) | `<base-url>/billing/budget`, `/billing/subscription` | `vibe`, `api` |
+| OpenCode Go (`opencode.ai/zen/go`) | `<base-url>/usage` | `rolling`, `weekly`, `monthly` |
+| OpenRouter (`openrouter.ai`) | `<base-url>/key`, `/credits` when the key may read it | `key`, `key-daily`, `key-weekly`, `key-monthly`, `credits` |
+| Codex, Claude | Passive quota headers from earlier responses; no polling | `five-hour`, `weekly` |
+
+OpenAI-compatible adapters are selected by base-url host, or by the provider names
+`mistral`, `opencode-go`, and `openrouter` for proxied endpoints. They only call
+the provider's own configured base URL with its own key. Other providers report
+`unsupported`. Subscription usage is separate from proxy token accounting under
+`/observability/usage`.
+
+`GET /v8/management/models` returns the same catalog as `/v1/models` in OpenAI
+list form, without requiring a client API key.
+
+### Model routes
+
+`model-routes` (see [config.example.yaml](../config.example.yaml)) exposes an alias
+backed by an ordered list of provider/model targets, which may be unrelated models.
+Targets are tried in order with each provider's own credentials, retries, and
+cooldowns. Credential, quota, availability, and upstream errors move to the next
+target; caller request errors and cancellation stop. A streamed response that has
+produced output is never switched. Responses, usage records, and payload rules keep
+the alias as the requested model, and the alias appears in model catalogs while one
+of its targets is available. Target `params` are applied before `requests.payload`
+rules on OpenAI-compatible providers. Aliases have no special suffixes:
+`model:fast` is an independent route.
 
 ## OAuth
 

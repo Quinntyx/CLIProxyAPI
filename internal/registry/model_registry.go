@@ -201,6 +201,8 @@ type ModelRegistry struct {
 	registrationEpoch atomic.Uint64
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
+	// modelRoutes are configured aliases projected into available-model catalogs.
+	modelRoutes []ModelRoute
 }
 
 // Global model registry instance
@@ -1370,10 +1372,11 @@ func (r *ModelRegistry) GetAvailableModelInfos() []*ModelInfo {
 }
 
 func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.Time) ([]map[string]any, time.Time) {
-	models := make([]map[string]any, 0, len(r.models))
+	models := make([]map[string]any, 0, len(r.models)+len(r.modelRoutes))
 	var expiresAt time.Time
+	routeAliases := r.routeAliasesLocked()
 
-	for _, registration := range r.models {
+	for modelID, registration := range r.models {
 		available, registrationExpiresAt := modelRegistrationAvailability(registration, now)
 		if !registrationExpiresAt.IsZero() && (expiresAt.IsZero() || registrationExpiresAt.Before(expiresAt)) {
 			expiresAt = registrationExpiresAt
@@ -1381,9 +1384,19 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 		if !available || registration == nil {
 			continue
 		}
+		// A configured route owns its alias, including execution, so it replaces
+		// a registered model with the same id.
+		if _, routed := routeAliases[modelID]; routed {
+			continue
+		}
 
 		model := r.convertModelToMap(registration.Info, handlerType)
 		if model != nil {
+			models = append(models, model)
+		}
+	}
+	for _, route := range r.modelRoutes {
+		if model := r.convertModelToMap(r.routeModelInfoLocked(route, now), handlerType); model != nil {
 			models = append(models, model)
 		}
 	}

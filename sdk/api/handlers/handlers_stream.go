@@ -296,9 +296,22 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
-	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
-	if !preparedRoute {
-		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
+	var routeDecision modelRouteDecision
+	if execOptions.modelRoute != nil {
+		originalRequestedModel = execOptions.modelRoute.Alias
+	} else {
+		var preparedRoute bool
+		routeDecision, preparedRoute = preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
+		if !preparedRoute {
+			routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
+		}
+		if routeDecision == (modelRouteDecision{}) {
+			if targets, ok := h.resolveModelRoute(modelName, execOptions); ok {
+				return h.streamModelRoute(ctx, targets, func(target modelRouteTarget) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+					return h.executeStreamWithAuthManagerFormats(ctx, entryProtocol, exitProtocol, target.Model, rawJSON, alt, allowImageModel, target.options(execOptions))
+				})
+			}
+		}
 	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
@@ -325,6 +338,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
+	applyModelRouteMetadata(reqMeta, execOptions.modelRoute)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
