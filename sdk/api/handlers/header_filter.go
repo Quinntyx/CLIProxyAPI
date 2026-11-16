@@ -48,9 +48,6 @@ var cpaReservedResponseHeaders = map[string]struct{}{
 
 // IsCPAReservedResponseHeader reports whether a downstream response header is managed by CPA.
 func IsCPAReservedResponseHeader(name string) bool {
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "x-cliproxyapi-quota-") {
-		return true
-	}
 	_, reserved := cpaReservedResponseHeaders[http.CanonicalHeaderKey(name)]
 	return reserved
 }
@@ -68,7 +65,7 @@ func FilterUpstreamHeaders(src http.Header) http.Header {
 		if _, blocked := hopByHopHeaders[canonicalKey]; blocked {
 			continue
 		}
-		if IsCPAReservedResponseHeader(canonicalKey) {
+		if _, reserved := cpaReservedResponseHeaders[canonicalKey]; reserved {
 			continue
 		}
 		if _, scoped := connectionScoped[canonicalKey]; scoped {
