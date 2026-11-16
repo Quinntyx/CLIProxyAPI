@@ -153,7 +153,9 @@ allowance, such as OpenRouter key spend when the key has no limit. OpenRouter
 `credits` is a prepaid balance: `used` is total spend and `remaining` is the
 balance still available, with no `limit` or `used_percent`. The Mistral `api`
 budget is likewise reported as money: `used` and `remaining` with `resets_at`, and
-no `limit` or `used_percent`, while `vibe` stays an allowance. For an OpenRouter key
+no `limit` or `used_percent`, while `vibe` stays an allowance. If Mistral omits the
+budget size or the usage percentage there is no amount to compute, and the `api`
+window keeps whichever of `limit` or `used_percent` was reported. For an OpenRouter key
 with a limit, `used` is the spend counted against that limit
 (`limit - limit_remaining`) when `limit_remaining` is reported, because a key
 limit may reset periodically; otherwise it stays the key's all-time spend.
