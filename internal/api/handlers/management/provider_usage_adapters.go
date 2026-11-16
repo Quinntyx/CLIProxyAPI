@@ -145,32 +145,47 @@ func finishUsageAccount(account ProviderUsageAccount) ProviderUsageAccount {
 	return account
 }
 
-// mistralUsage reports the Vibe and API budgets separately.
+// mistralBudgetWindow builds one budget window. A money budget is reported as
+// used and remaining amounts without a limit or percentage.
+func mistralBudgetWindow(entry gjson.Result, id, label string, money bool) ProviderUsageWindow {
+	window := ProviderUsageWindow{ID: id, Label: label}
+	window.UsedPercent = numberPtr(entry.Get("usage_percentage"))
+	window.Limit = numberPtr(entry.Get("initial_budget"))
+	if window.Limit != nil && window.UsedPercent != nil {
+		used := *window.Limit * *window.UsedPercent / 100
+		window.Used = floatPtr(used)
+		window.Remaining = floatPtr(*window.Limit - used)
+	}
+	if money && window.Used != nil {
+		// The money budget is a spend amount, not a share of the budget.
+		window.UsedPercent = nil
+		window.Limit = nil
+	}
+	window.Unit = strings.ToLower(strings.TrimSpace(entry.Get("currency").String()))
+	window.ResetsAt = normalizeResetTime(entry.Get("reset_at"))
+	return window
+}
+
+// mistralUsage reports the Vibe budget as an allowance and the API budget as
+// money (used and remaining) without a limit or percentage.
 func mistralUsage(ctx context.Context, h *Handler, provider *configuredProvider, auth *coreauth.Auth, _ time.Time) ProviderUsageAccount {
 	budget, failure := h.usageGetJSON(ctx, provider, auth, "/billing/budget")
 	if failure != nil {
 		return *failure
 	}
 	var account ProviderUsageAccount
-	for _, item := range []struct{ field, id, label string }{
-		{"vibe_budget", "vibe", "Vibe"},
-		{"api_budget", "api", "API"},
+	for _, item := range []struct {
+		field, id, label string
+		money            bool
+	}{
+		{"vibe_budget", "vibe", "Vibe", false},
+		{"api_budget", "api", "API", true},
 	} {
 		entry := budget.Get(item.field)
 		if !entry.IsObject() {
 			continue
 		}
-		window := ProviderUsageWindow{ID: item.id, Label: item.label}
-		window.UsedPercent = numberPtr(entry.Get("usage_percentage"))
-		window.Limit = numberPtr(entry.Get("initial_budget"))
-		if window.Limit != nil && window.UsedPercent != nil {
-			used := *window.Limit * *window.UsedPercent / 100
-			window.Used = floatPtr(used)
-			window.Remaining = floatPtr(*window.Limit - used)
-		}
-		window.Unit = strings.ToLower(strings.TrimSpace(entry.Get("currency").String()))
-		window.ResetsAt = normalizeResetTime(entry.Get("reset_at"))
-		account.Windows = append(account.Windows, window)
+		account.Windows = append(account.Windows, mistralBudgetWindow(entry, item.id, item.label, item.money))
 	}
 	if subscription, errSub := h.usageGetJSON(ctx, provider, auth, "/billing/subscription"); errSub == nil {
 		account.Plan = strings.TrimSpace(subscription.Get("plan_name").String())
@@ -204,8 +219,29 @@ func opencodeGoUsage(ctx context.Context, h *Handler, provider *configuredProvid
 	return finishUsageAccount(account)
 }
 
+// openRouterKeyWindow builds the key spend window from /key data. "usage" is
+// all-time spend while a key limit may reset periodically, so spend against a
+// limit comes from limit_remaining when OpenRouter reports it.
+func openRouterKeyWindow(data gjson.Result) (ProviderUsageWindow, bool) {
+	used := numberPtr(data.Get("usage"))
+	if used == nil {
+		return ProviderUsageWindow{}, false
+	}
+	window := ProviderUsageWindow{ID: "key", Label: "Key spend", Used: used, Unit: "usd"}
+	window.Limit = numberPtr(data.Get("limit"))
+	window.Remaining = numberPtr(data.Get("limit_remaining"))
+	if window.Limit != nil && window.Remaining != nil {
+		window.Used = floatPtr(*window.Limit - *window.Remaining)
+	}
+	if window.Limit != nil && *window.Limit > 0 {
+		window.UsedPercent = floatPtr(*window.Used / *window.Limit * 100)
+	}
+	return window, true
+}
+
 // openRouterUsage reports key spend and, when the key may read them, account
 // credits. A null key limit is reported as unknown, never as zero or unlimited.
+// Account credits are a prepaid balance, reported without a limit or percentage.
 func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvider, auth *coreauth.Auth, _ time.Time) ProviderUsageAccount {
 	key, failure := h.usageGetJSON(ctx, provider, auth, "/key")
 	if failure != nil {
@@ -213,13 +249,7 @@ func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvid
 	}
 	data := key.Get("data")
 	var account ProviderUsageAccount
-	if used := numberPtr(data.Get("usage")); used != nil {
-		window := ProviderUsageWindow{ID: "key", Label: "Key spend", Used: used, Unit: "usd"}
-		window.Limit = numberPtr(data.Get("limit"))
-		window.Remaining = numberPtr(data.Get("limit_remaining"))
-		if window.Limit != nil && *window.Limit > 0 {
-			window.UsedPercent = floatPtr(*used / *window.Limit * 100)
-		}
+	if window, ok := openRouterKeyWindow(data); ok {
 		account.Windows = append(account.Windows, window)
 	}
 	for _, item := range []struct{ field, id, label string }{
@@ -238,10 +268,8 @@ func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvid
 		total := numberPtr(credits.Get("data.total_credits"))
 		used := numberPtr(credits.Get("data.total_usage"))
 		if total != nil && used != nil {
-			window := ProviderUsageWindow{ID: "credits", Label: "Account credits", Used: used, Limit: total, Remaining: floatPtr(*total - *used), Unit: "usd"}
-			if *total > 0 {
-				window.UsedPercent = floatPtr(*used / *total * 100)
-			}
+			// Credits are a prepaid balance, not an allowance, so no limit or percentage is reported.
+			window := ProviderUsageWindow{ID: "credits", Label: "Account credits", Used: used, Remaining: floatPtr(*total - *used), Unit: "usd"}
 			account.Windows = append(account.Windows, window)
 		}
 	}

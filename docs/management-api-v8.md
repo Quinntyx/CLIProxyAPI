@@ -138,7 +138,7 @@ adapter exists, not that the credential is valid.
 Unknown providers return 404.
 
 ```json
-{"provider_id":"mistral","accounts":[{"id":"1a2b3c4d5e6f7a8b","status":"ok","plan":"Pro","checked_at":"2026-11-14T03:00:00Z","windows":[{"id":"api","label":"API","used_percent":25,"used":3.75,"limit":15,"remaining":11.25,"unit":"usd","resets_at":"2026-12-01T00:00:00Z"}]}]}
+{"provider_id":"mistral","accounts":[{"id":"1a2b3c4d5e6f7a8b","status":"ok","plan":"Pro","checked_at":"2026-11-14T03:00:00Z","windows":[{"id":"vibe","label":"Vibe","used_percent":40,"used":8,"limit":20,"remaining":12,"unit":"eur","resets_at":"2026-12-01T00:00:00Z"},{"id":"api","label":"API","used":3.75,"remaining":11.25,"unit":"usd","resets_at":"2026-12-01T00:00:00Z"}]}]}
 ```
 
 Account `status` is `ok`, `unsupported`, `unavailable`, or `error`; failed or
@@ -146,6 +146,19 @@ unsupported accounts have empty `windows` and a short `error`. One account's
 failure does not affect the others. Window values the vendor does not report are
 omitted rather than shown as zero or unlimited. Currency amounts are money in
 `unit`, not tokens.
+
+A window with `used_percent` or a positive `limit` is an allowance. A window with
+only `used` and/or `remaining` in a currency `unit` is a plain money amount with no
+allowance, such as OpenRouter key spend when the key has no limit. OpenRouter
+`credits` is a prepaid balance: `used` is total spend and `remaining` is the
+balance still available, with no `limit` or `used_percent`. The Mistral `api`
+budget is likewise reported as money: `used` and `remaining` with `resets_at`, and
+no `limit` or `used_percent`, while `vibe` stays an allowance. If Mistral omits the
+budget size or the usage percentage there is no amount to compute, and the `api`
+window keeps whichever of `limit` or `used_percent` was reported. For an OpenRouter key
+with a limit, `used` is the spend counted against that limit
+(`limit - limit_remaining`) when `limit_remaining` is reported, because a key
+limit may reset periodically; otherwise it stays the key's all-time spend.
 
 | Provider | Source | Windows |
 | --- | --- | --- |

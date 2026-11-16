@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 type usageStub struct {
@@ -77,6 +78,17 @@ func newProvidersFixture(t *testing.T) *providersFixture {
 			_, _ = w.Write([]byte(`{"error":{"message":"invalid key sk-or-v1-secretvalue"}}`))
 			return
 		}
+		if r.Header.Get("Authorization") == "Bearer or-limited-key" {
+			switch r.URL.Path {
+			case "/api/v1/key":
+				_, _ = w.Write([]byte(`{"data":{"label":"sk-or-v1-lim...ted","usage":57.5,"usage_daily":0.5,"usage_weekly":1.5,"usage_monthly":7.5,"limit":10,"limit_remaining":2.5,"limit_reset":"monthly","is_free_tier":false}}`))
+			case "/api/v1/credits":
+				_, _ = w.Write([]byte(`{"data":{"total_credits":100,"total_usage":97}}`))
+			default:
+				http.NotFound(w, r)
+			}
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/key":
 			_, _ = w.Write([]byte(`{"data":{"label":"sk-or-v1-abc...xyz","usage":3.5,"usage_daily":0.5,"usage_weekly":1.5,"usage_monthly":3.5,"limit":null,"limit_remaining":null,"limit_reset":null,"is_free_tier":false}}`))
@@ -112,7 +124,7 @@ api-keys:
       keys: [{api-key: go-test-key}]
     - name: openrouter
       base-url: %[3]s/api/v1
-      keys: [{api-key: or-good-key}, {api-key: or-bad-key}]
+      keys: [{api-key: or-good-key}, {api-key: or-bad-key}, {api-key: or-limited-key}]
     - name: inco
       base-url: https://api.inco.ai/v1
       keys: [{api-key: inco-test-key}]
@@ -147,6 +159,7 @@ api-keys:
 		compatAuth("go-1", "opencode-go", goServer.URL+"/zen/go/v1", "go-test-key"),
 		compatAuth("or-1", "openrouter", openRouterServer.URL+"/api/v1", "or-good-key"),
 		compatAuth("or-2", "openrouter", openRouterServer.URL+"/api/v1", "or-bad-key"),
+		compatAuth("or-3", "openrouter", openRouterServer.URL+"/api/v1", "or-limited-key"),
 		compatAuth("inco-1", "inco", "https://api.inco.ai/v1", "inco-test-key"),
 		codex,
 		{ID: "gemini-oauth", Provider: "gemini-cli", Status: coreauth.StatusActive},
@@ -191,7 +204,7 @@ func (f *providersFixture) get(t *testing.T, path string, authorized bool) (int,
 
 func assertNoSecrets(t *testing.T, body []byte) {
 	t.Helper()
-	for _, secret := range []string{"mistral-test-key", "go-test-key", "or-good-key", "or-bad-key", "inco-test-key", "featherless-test-key", "sk-or-v1"} {
+	for _, secret := range []string{"mistral-test-key", "go-test-key", "or-good-key", "or-bad-key", "or-limited-key", "inco-test-key", "featherless-test-key", "sk-or-v1"} {
 		if strings.Contains(string(body), secret) {
 			t.Fatalf("response leaks %q: %s", secret, body)
 		}
@@ -258,25 +271,28 @@ func TestManagementV8ProvidersContract(t *testing.T) {
 	}
 }
 
+// usageResponseWindow is one window of a /v8/management usage response.
+type usageResponseWindow struct {
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	UsedPercent *float64 `json:"used_percent"`
+	Used        *float64 `json:"used"`
+	Limit       *float64 `json:"limit"`
+	Remaining   *float64 `json:"remaining"`
+	Unit        string   `json:"unit"`
+	ResetsAt    string   `json:"resets_at"`
+}
+
 type usageResponse struct {
 	ProviderID string `json:"provider_id"`
 	Accounts   []struct {
-		ID        string `json:"id"`
-		Label     string `json:"label"`
-		Status    string `json:"status"`
-		Plan      string `json:"plan"`
-		CheckedAt string `json:"checked_at"`
-		Error     string `json:"error"`
-		Windows   []struct {
-			ID          string   `json:"id"`
-			Label       string   `json:"label"`
-			UsedPercent *float64 `json:"used_percent"`
-			Used        *float64 `json:"used"`
-			Limit       *float64 `json:"limit"`
-			Remaining   *float64 `json:"remaining"`
-			Unit        string   `json:"unit"`
-			ResetsAt    string   `json:"resets_at"`
-		} `json:"windows"`
+		ID        string                `json:"id"`
+		Label     string                `json:"label"`
+		Status    string                `json:"status"`
+		Plan      string                `json:"plan"`
+		CheckedAt string                `json:"checked_at"`
+		Error     string                `json:"error"`
+		Windows   []usageResponseWindow `json:"windows"`
 	} `json:"accounts"`
 }
 
@@ -319,11 +335,45 @@ func TestManagementV8MistralUsageSeparatesVibeAndAPIBudgets(t *testing.T) {
 		t.Fatalf("windows = %+v", windows)
 	}
 	api := windows[1]
-	if *api.UsedPercent != 25 || *api.Used != 3.75 || *api.Limit != 15 || *api.Remaining != 11.25 || api.Unit != "usd" || api.ResetsAt != "2026-12-01T00:00:00Z" {
+	if api.Used == nil || *api.Used != 3.75 {
+		t.Fatalf("api used = %v", api.Used)
+	}
+	if api.Remaining == nil || *api.Remaining != 11.25 {
+		t.Fatalf("api remaining = %v", api.Remaining)
+	}
+	if api.Unit != "usd" || api.ResetsAt != "2026-12-01T00:00:00Z" {
 		t.Fatalf("api window = %+v", api)
 	}
-	if windows[0].Unit != "eur" || *windows[0].Used != 8 {
-		t.Fatalf("vibe window = %+v", windows[0])
+	if api.Limit != nil || api.UsedPercent != nil {
+		t.Fatalf("api window must be money: %+v", api)
+	}
+	vibe := windows[0]
+	if vibe.UsedPercent == nil || *vibe.UsedPercent != 40 {
+		t.Fatalf("vibe used_percent = %v", vibe.UsedPercent)
+	}
+	if vibe.Used == nil || *vibe.Used != 8 {
+		t.Fatalf("vibe used = %v", vibe.Used)
+	}
+	if vibe.Limit == nil || *vibe.Limit != 20 {
+		t.Fatalf("vibe limit = %v", vibe.Limit)
+	}
+	if vibe.Remaining == nil || *vibe.Remaining != 12 {
+		t.Fatalf("vibe remaining = %v", vibe.Remaining)
+	}
+	if vibe.Unit != "eur" {
+		t.Fatalf("vibe window = %+v", vibe)
+	}
+	code, body := f.get(t, "/v8/management/providers/mistral/usage", true)
+	if code != http.StatusOK {
+		t.Fatalf("usage status=%d body=%s", code, body)
+	}
+	apiJSON := gjson.GetBytes(body, `accounts.0.windows.#(id=="api")`)
+	vibeJSON := gjson.GetBytes(body, `accounts.0.windows.#(id=="vibe")`)
+	if !apiJSON.IsObject() || apiJSON.Get("limit").Exists() || apiJSON.Get("used_percent").Exists() {
+		t.Fatalf("api window JSON = %s", apiJSON.Raw)
+	}
+	if !vibeJSON.IsObject() || !vibeJSON.Get("limit").Exists() || !vibeJSON.Get("used_percent").Exists() {
+		t.Fatalf("vibe window JSON = %s", vibeJSON.Raw)
 	}
 	for _, seen := range f.mistral.seen {
 		if !strings.HasSuffix(seen, " Bearer mistral-test-key") || !strings.HasPrefix(seen, "/v1/billing/") {
@@ -350,16 +400,24 @@ func TestManagementV8OpenCodeGoUsageWindows(t *testing.T) {
 func TestManagementV8OpenRouterUsageIsolatesAccountFailures(t *testing.T) {
 	f := newProvidersFixture(t)
 	resp := f.usage(t, "openrouter")
-	if len(resp.Accounts) != 2 {
+	if len(resp.Accounts) != 3 {
 		t.Fatalf("accounts = %+v", resp.Accounts)
 	}
-	var ok, failed int
+	var ok, unlimited, failed int
 	for _, account := range resp.Accounts {
 		switch account.Status {
 		case "ok":
 			ok++
 			key := account.Windows[0]
-			if key.ID != "key" || *key.Used != 3.5 || key.Limit != nil || key.Remaining != nil || key.UsedPercent != nil {
+			if key.ID != "key" {
+				t.Fatalf("first window must be key spend: %+v", key)
+			}
+			if key.Limit != nil {
+				// A key with a limit reports spend against that limit.
+				continue
+			}
+			unlimited++
+			if *key.Used != 3.5 || key.Remaining != nil || key.UsedPercent != nil {
 				t.Fatalf("null key limit must stay unknown: %+v", key)
 			}
 			for _, window := range account.Windows {
@@ -374,8 +432,67 @@ func TestManagementV8OpenRouterUsageIsolatesAccountFailures(t *testing.T) {
 			}
 		}
 	}
-	if ok != 1 || failed != 1 {
-		t.Fatalf("ok=%d failed=%d accounts=%+v", ok, failed, resp.Accounts)
+	if ok != 2 || unlimited != 1 || failed != 1 {
+		t.Fatalf("ok=%d unlimited=%d failed=%d accounts=%+v", ok, unlimited, failed, resp.Accounts)
+	}
+}
+
+func TestManagementV8OpenRouterCreditsAreBalanceNotQuota(t *testing.T) {
+	f := newProvidersFixture(t)
+	resp := f.usage(t, "openrouter")
+	var limited int
+	for _, account := range resp.Accounts {
+		var key, credits *usageResponseWindow
+		for i := range account.Windows {
+			window := &account.Windows[i]
+			switch window.ID {
+			case "key":
+				key = window
+			case "credits":
+				credits = window
+			}
+		}
+		if key == nil || key.Limit == nil {
+			continue
+		}
+		limited++
+		if *key.Used != 7.5 || *key.Limit != 10 || key.Remaining == nil || *key.Remaining != 2.5 || key.UsedPercent == nil || *key.UsedPercent != 75 || key.Unit != "usd" {
+			t.Fatalf("limited key window = %+v", *key)
+		}
+		if credits == nil {
+			t.Fatalf("readable credits endpoint must produce a window: %+v", account)
+		}
+		if credits.Used == nil || *credits.Used != 97 || credits.Remaining == nil || *credits.Remaining != 3 || credits.Unit != "usd" {
+			t.Fatalf("credits window = %+v", *credits)
+		}
+		if credits.Limit != nil || credits.UsedPercent != nil {
+			t.Fatalf("credits are a balance, not a quota: %+v", *credits)
+		}
+	}
+	if limited != 1 {
+		t.Fatalf("limited=%d accounts=%+v", limited, resp.Accounts)
+	}
+
+	// The wire form must not carry a limit or percentage on the balance window.
+	code, body := f.get(t, "/v8/management/providers/openrouter/usage", true)
+	if code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", code, body)
+	}
+	assertNoSecrets(t, body)
+	var found bool
+	for _, account := range gjson.GetBytes(body, "accounts").Array() {
+		for _, window := range account.Get("windows").Array() {
+			if window.Get("id").String() != "credits" {
+				continue
+			}
+			found = true
+			if window.Get("limit").Exists() || window.Get("used_percent").Exists() {
+				t.Fatalf("credits window exposes an allowance: %s", window.Raw)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no credits window in body: %s", body)
 	}
 }
 
