@@ -140,7 +140,7 @@ func TestBurnCalibrationAndTPS(t *testing.T) {
 		t.Fatal("active rate should survive idle time")
 	}
 }
-func TestBurnDeadlineOverridesStickyThenLatches(t *testing.T) {
+func TestBurnDeadlineOverridesStickyOnlyWhileUrgent(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	b := burnTestController(now)
 	a := &Auth{ID: "burn-A", Provider: "codex"}
@@ -164,10 +164,10 @@ func TestBurnDeadlineOverridesStickyThenLatches(t *testing.T) {
 	if err != nil || chosen.ID != z.ID {
 		t.Fatalf("urgent plan did not override sticky: %v, %+v", err, chosen)
 	}
-	b.lastTokenTPS = 100
+	b.lastTokenTPS = 11
 	chosen, err = selector.Pick(context.Background(), "codex", "", opts, []*Auth{a, z})
 	if err != nil || chosen.ID != z.ID {
-		t.Fatal("burn target must latch, not oscillate")
+		t.Fatal("still-urgent burn target must retain routing affinity")
 	}
 	z.Disabled = true
 	chosen, err = selector.Pick(context.Background(), "codex", "", opts, []*Auth{a, z})
