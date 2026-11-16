@@ -41,3 +41,38 @@ func TestOpenRouterKeyWindow(t *testing.T) {
 		t.Fatal("a key without usage must not produce a window")
 	}
 }
+
+func TestMistralBudgetWindow(t *testing.T) {
+	num := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name                            string
+		data                            string
+		id, label                       string
+		money                           bool
+		used, limit, remaining, percent *float64
+		unit, resetsAt                  string
+	}{
+		{"allowance budget", `{"usage_percentage":40,"initial_budget":20,"currency":"EUR","reset_at":"2026-12-01T00:00:00Z"}`, "vibe", "Vibe", false, num(8), num(20), num(12), num(40), "eur", "2026-12-01T00:00:00Z"},
+		{"money budget", `{"usage_percentage":25,"initial_budget":15,"currency":"USD","reset_at":"2026-12-01T00:00:00Z"}`, "api", "API", true, num(3.75), nil, num(11.25), nil, "usd", "2026-12-01T00:00:00Z"},
+		{"untouched money budget", `{"usage_percentage":0,"initial_budget":15,"currency":"USD"}`, "api", "API", true, num(0), nil, num(15), nil, "usd", ""},
+		{"money budget without a size", `{"usage_percentage":25,"currency":"USD"}`, "api", "API", true, nil, nil, nil, num(25), "usd", ""},
+		{"money budget without a percentage", `{"initial_budget":15,"currency":"USD"}`, "api", "API", true, nil, num(15), nil, nil, "usd", ""},
+	}
+	same := func(got, want *float64) bool {
+		if got == nil || want == nil {
+			return got == want
+		}
+		return *got == *want
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			window := mistralBudgetWindow(gjson.Parse(tc.data), tc.id, tc.label, tc.money)
+			if window.ID != tc.id || window.Label != tc.label || window.Unit != tc.unit || window.ResetsAt != tc.resetsAt {
+				t.Fatalf("window = %+v", window)
+			}
+			if !same(window.Used, tc.used) || !same(window.Limit, tc.limit) || !same(window.Remaining, tc.remaining) || !same(window.UsedPercent, tc.percent) {
+				t.Fatalf("window = %+v", window)
+			}
+		})
+	}
+}

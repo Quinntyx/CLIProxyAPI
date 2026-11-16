@@ -335,11 +335,45 @@ func TestManagementV8MistralUsageSeparatesVibeAndAPIBudgets(t *testing.T) {
 		t.Fatalf("windows = %+v", windows)
 	}
 	api := windows[1]
-	if *api.UsedPercent != 25 || *api.Used != 3.75 || *api.Limit != 15 || *api.Remaining != 11.25 || api.Unit != "usd" || api.ResetsAt != "2026-12-01T00:00:00Z" {
+	if api.Used == nil || *api.Used != 3.75 {
+		t.Fatalf("api used = %v", api.Used)
+	}
+	if api.Remaining == nil || *api.Remaining != 11.25 {
+		t.Fatalf("api remaining = %v", api.Remaining)
+	}
+	if api.Unit != "usd" || api.ResetsAt != "2026-12-01T00:00:00Z" {
 		t.Fatalf("api window = %+v", api)
 	}
-	if windows[0].Unit != "eur" || *windows[0].Used != 8 {
-		t.Fatalf("vibe window = %+v", windows[0])
+	if api.Limit != nil || api.UsedPercent != nil {
+		t.Fatalf("api window must be money: %+v", api)
+	}
+	vibe := windows[0]
+	if vibe.UsedPercent == nil || *vibe.UsedPercent != 40 {
+		t.Fatalf("vibe used_percent = %v", vibe.UsedPercent)
+	}
+	if vibe.Used == nil || *vibe.Used != 8 {
+		t.Fatalf("vibe used = %v", vibe.Used)
+	}
+	if vibe.Limit == nil || *vibe.Limit != 20 {
+		t.Fatalf("vibe limit = %v", vibe.Limit)
+	}
+	if vibe.Remaining == nil || *vibe.Remaining != 12 {
+		t.Fatalf("vibe remaining = %v", vibe.Remaining)
+	}
+	if vibe.Unit != "eur" {
+		t.Fatalf("vibe window = %+v", vibe)
+	}
+	code, body := f.get(t, "/v8/management/providers/mistral/usage", true)
+	if code != http.StatusOK {
+		t.Fatalf("usage status=%d body=%s", code, body)
+	}
+	apiJSON := gjson.GetBytes(body, `accounts.0.windows.#(id=="api")`)
+	vibeJSON := gjson.GetBytes(body, `accounts.0.windows.#(id=="vibe")`)
+	if !apiJSON.IsObject() || apiJSON.Get("limit").Exists() || apiJSON.Get("used_percent").Exists() {
+		t.Fatalf("api window JSON = %s", apiJSON.Raw)
+	}
+	if !vibeJSON.IsObject() || !vibeJSON.Get("limit").Exists() || !vibeJSON.Get("used_percent").Exists() {
+		t.Fatalf("vibe window JSON = %s", vibeJSON.Raw)
 	}
 	for _, seen := range f.mistral.seen {
 		if !strings.HasSuffix(seen, " Bearer mistral-test-key") || !strings.HasPrefix(seen, "/v1/billing/") {

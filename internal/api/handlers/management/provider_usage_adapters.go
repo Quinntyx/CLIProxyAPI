@@ -145,32 +145,47 @@ func finishUsageAccount(account ProviderUsageAccount) ProviderUsageAccount {
 	return account
 }
 
-// mistralUsage reports the Vibe and API budgets separately.
+// mistralBudgetWindow builds one budget window. A money budget is reported as
+// used and remaining amounts without a limit or percentage.
+func mistralBudgetWindow(entry gjson.Result, id, label string, money bool) ProviderUsageWindow {
+	window := ProviderUsageWindow{ID: id, Label: label}
+	window.UsedPercent = numberPtr(entry.Get("usage_percentage"))
+	window.Limit = numberPtr(entry.Get("initial_budget"))
+	if window.Limit != nil && window.UsedPercent != nil {
+		used := *window.Limit * *window.UsedPercent / 100
+		window.Used = floatPtr(used)
+		window.Remaining = floatPtr(*window.Limit - used)
+	}
+	if money && window.Used != nil {
+		// The money budget is a spend amount, not a share of the budget.
+		window.UsedPercent = nil
+		window.Limit = nil
+	}
+	window.Unit = strings.ToLower(strings.TrimSpace(entry.Get("currency").String()))
+	window.ResetsAt = normalizeResetTime(entry.Get("reset_at"))
+	return window
+}
+
+// mistralUsage reports the Vibe budget as an allowance and the API budget as
+// money (used and remaining) without a limit or percentage.
 func mistralUsage(ctx context.Context, h *Handler, provider *configuredProvider, auth *coreauth.Auth, _ time.Time) ProviderUsageAccount {
 	budget, failure := h.usageGetJSON(ctx, provider, auth, "/billing/budget")
 	if failure != nil {
 		return *failure
 	}
 	var account ProviderUsageAccount
-	for _, item := range []struct{ field, id, label string }{
-		{"vibe_budget", "vibe", "Vibe"},
-		{"api_budget", "api", "API"},
+	for _, item := range []struct {
+		field, id, label string
+		money            bool
+	}{
+		{"vibe_budget", "vibe", "Vibe", false},
+		{"api_budget", "api", "API", true},
 	} {
 		entry := budget.Get(item.field)
 		if !entry.IsObject() {
 			continue
 		}
-		window := ProviderUsageWindow{ID: item.id, Label: item.label}
-		window.UsedPercent = numberPtr(entry.Get("usage_percentage"))
-		window.Limit = numberPtr(entry.Get("initial_budget"))
-		if window.Limit != nil && window.UsedPercent != nil {
-			used := *window.Limit * *window.UsedPercent / 100
-			window.Used = floatPtr(used)
-			window.Remaining = floatPtr(*window.Limit - used)
-		}
-		window.Unit = strings.ToLower(strings.TrimSpace(entry.Get("currency").String()))
-		window.ResetsAt = normalizeResetTime(entry.Get("reset_at"))
-		account.Windows = append(account.Windows, window)
+		account.Windows = append(account.Windows, mistralBudgetWindow(entry, item.id, item.label, item.money))
 	}
 	if subscription, errSub := h.usageGetJSON(ctx, provider, auth, "/billing/subscription"); errSub == nil {
 		account.Plan = strings.TrimSpace(subscription.Get("plan_name").String())
