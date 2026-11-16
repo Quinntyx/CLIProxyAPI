@@ -204,6 +204,26 @@ func opencodeGoUsage(ctx context.Context, h *Handler, provider *configuredProvid
 	return finishUsageAccount(account)
 }
 
+// openRouterKeyWindow builds the key spend window from /key data. "usage" is
+// all-time spend while a key limit may reset periodically, so spend against a
+// limit comes from limit_remaining when OpenRouter reports it.
+func openRouterKeyWindow(data gjson.Result) (ProviderUsageWindow, bool) {
+	used := numberPtr(data.Get("usage"))
+	if used == nil {
+		return ProviderUsageWindow{}, false
+	}
+	window := ProviderUsageWindow{ID: "key", Label: "Key spend", Used: used, Unit: "usd"}
+	window.Limit = numberPtr(data.Get("limit"))
+	window.Remaining = numberPtr(data.Get("limit_remaining"))
+	if window.Limit != nil && window.Remaining != nil {
+		window.Used = floatPtr(*window.Limit - *window.Remaining)
+	}
+	if window.Limit != nil && *window.Limit > 0 {
+		window.UsedPercent = floatPtr(*window.Used / *window.Limit * 100)
+	}
+	return window, true
+}
+
 // openRouterUsage reports key spend and, when the key may read them, account
 // credits. A null key limit is reported as unknown, never as zero or unlimited.
 // Account credits are a prepaid balance, reported without a limit or percentage.
@@ -214,20 +234,7 @@ func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvid
 	}
 	data := key.Get("data")
 	var account ProviderUsageAccount
-	if used := numberPtr(data.Get("usage")); used != nil {
-		window := ProviderUsageWindow{ID: "key", Label: "Key spend", Used: used, Unit: "usd"}
-		window.Limit = numberPtr(data.Get("limit"))
-		window.Remaining = numberPtr(data.Get("limit_remaining"))
-		if window.Limit != nil && *window.Limit > 0 {
-			// Usage is all-time spend while a key limit may reset, so spend
-			// against the limit comes from limit_remaining when reported.
-			if window.Remaining != nil {
-				window.Used = floatPtr(*window.Limit - *window.Remaining)
-				window.UsedPercent = floatPtr(*window.Used / *window.Limit * 100)
-			} else {
-				window.UsedPercent = floatPtr(*used / *window.Limit * 100)
-			}
-		}
+	if window, ok := openRouterKeyWindow(data); ok {
 		account.Windows = append(account.Windows, window)
 	}
 	for _, item := range []struct{ field, id, label string }{
