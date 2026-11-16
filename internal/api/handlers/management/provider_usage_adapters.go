@@ -206,6 +206,7 @@ func opencodeGoUsage(ctx context.Context, h *Handler, provider *configuredProvid
 
 // openRouterUsage reports key spend and, when the key may read them, account
 // credits. A null key limit is reported as unknown, never as zero or unlimited.
+// Account credits are a prepaid balance, reported without a limit or percentage.
 func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvider, auth *coreauth.Auth, _ time.Time) ProviderUsageAccount {
 	key, failure := h.usageGetJSON(ctx, provider, auth, "/key")
 	if failure != nil {
@@ -218,7 +219,14 @@ func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvid
 		window.Limit = numberPtr(data.Get("limit"))
 		window.Remaining = numberPtr(data.Get("limit_remaining"))
 		if window.Limit != nil && *window.Limit > 0 {
-			window.UsedPercent = floatPtr(*used / *window.Limit * 100)
+			// Usage is all-time spend while a key limit may reset, so spend
+			// against the limit comes from limit_remaining when reported.
+			if window.Remaining != nil {
+				window.Used = floatPtr(*window.Limit - *window.Remaining)
+				window.UsedPercent = floatPtr(*window.Used / *window.Limit * 100)
+			} else {
+				window.UsedPercent = floatPtr(*used / *window.Limit * 100)
+			}
 		}
 		account.Windows = append(account.Windows, window)
 	}
@@ -238,10 +246,8 @@ func openRouterUsage(ctx context.Context, h *Handler, provider *configuredProvid
 		total := numberPtr(credits.Get("data.total_credits"))
 		used := numberPtr(credits.Get("data.total_usage"))
 		if total != nil && used != nil {
-			window := ProviderUsageWindow{ID: "credits", Label: "Account credits", Used: used, Limit: total, Remaining: floatPtr(*total - *used), Unit: "usd"}
-			if *total > 0 {
-				window.UsedPercent = floatPtr(*used / *total * 100)
-			}
+			// Credits are a prepaid balance, not an allowance, so no limit or percentage is reported.
+			window := ProviderUsageWindow{ID: "credits", Label: "Account credits", Used: used, Remaining: floatPtr(*total - *used), Unit: "usd"}
 			account.Windows = append(account.Windows, window)
 		}
 	}

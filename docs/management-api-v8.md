@@ -147,6 +147,14 @@ failure does not affect the others. Window values the vendor does not report are
 omitted rather than shown as zero or unlimited. Currency amounts are money in
 `unit`, not tokens.
 
+A window with `used_percent` or a positive `limit` is an allowance. A window with
+only `used` and/or `remaining` in a currency `unit` is a plain money amount with no
+allowance, such as OpenRouter key spend when the key has no limit. OpenRouter
+`credits` is a prepaid balance: `used` is total spend and `remaining` is the
+balance still available, with no `limit` or `used_percent`. For an OpenRouter key
+with a limit, `used` is the spend counted against that limit
+(`limit - limit_remaining`), because a key limit may reset periodically.
+
 | Provider | Source | Windows |
 | --- | --- | --- |
 | Mistral (`api.mistral.ai`) | `<base-url>/billing/budget`, `/billing/subscription` | `vibe`, `api` |
